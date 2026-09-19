@@ -1,0 +1,344 @@
+// AV1SoftwarePlayer.swift — software AV1 playback backend.
+//
+// ADDITIVE file. Implements the same NativeVideoPlayerApiDelegate contract as
+// the AVPlayer-based controller, but decodes with dav1d (via GAV1Player) and
+// renders through AVSampleBufferDisplayLayer + AVSampleBufferRenderSynchronizer
+// (+ AVSampleBufferAudioRenderer when the source has audio).
+//
+// It is engaged ONLY when BOTH hold:
+//   1. the source's video stream is AV1 (probed with GAV1Probe), and
+//   2. the device has no AV1 hardware decoder (AV1Capability).
+// Every other format keeps using the existing AVPlayer code path, byte for
+// byte unchanged.
+
+import AVFoundation
+import CoreMedia
+
+final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
+
+    // MARK: - plumbing back to Flutter (mirrors the AVPlayer controller)
+
+    private let api: NativeVideoPlayerApi
+
+    // MARK: - render pipeline
+
+    private let displayLayer = AVSampleBufferDisplayLayer()
+    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    private let audioRenderer = AVSampleBufferAudioRenderer()
+    private var hasAudioRenderer = false
+
+    // MARK: - decode engine
+
+    private var engine: GAV1Player?
+    private var sourceURL: URL?
+    private var sourceHeaders: [String: String] = [:]
+    private let pumpQueue = DispatchQueue(label: "av1.software.pump", qos: .userInitiated)
+    private var pumping = false
+    private var atEOF = false
+    private var lastEnqueuedPTS = CMTime.zero
+    // Set when teardown/stop is requested; read on the pump thread to break
+    // out of the backpressure waits below. NSLock-guarded: written from the
+    // main thread (stopPump/teardown/load), read from the pump thread.
+    private var stopFlag = false
+    private let stopLock = NSLock()
+
+    // MARK: - state (mirrors AVPlayer controller semantics)
+
+    private var loop = false
+    private var rate: Float = 0
+    private var speed: Double = 1
+    private var volume: Float = 1
+    private var info = VideoInfo(height: 0, width: 0, duration: 0)
+    private var endedNotified = false
+
+    init(api: NativeVideoPlayerApi) {
+        self.api = api
+        super.init()
+        api.delegate = self
+        displayLayer.videoGravity = .resizeAspectFit
+        synchronizer.addRenderer(displayLayer)
+        // Audio renderer is added lazily on first audio frame (sources
+        // without audio must never add it: an idle audio renderer stalls
+        // the synchronizer clock).
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(displayLayerFailed(_:)),
+            name: .AVSampleBufferDisplayLayerFailedToDecode,
+            object: displayLayer
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        teardownEngine()
+    }
+
+    /// The layer the platform view must display instead of the AVPlayerLayer.
+    var layer: CALayer { displayLayer }
+
+    // MARK: - NativeVideoPlayerApiDelegate
+
+    func loadVideoSource(videoSource: VideoSource) {
+        teardownEngine()
+        endedNotified = false
+        atEOF = false
+        lastEnqueuedPTS = .zero
+
+        let isURL = videoSource.type == .network
+        guard let url = isURL ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else {
+            api.onError(NSError(domain: "AV1SoftwarePlayer", code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: "invalid source URL"]) as Error)
+            return
+        }
+        sourceURL = url
+        sourceHeaders = videoSource.headers
+
+        let engine = GAV1Player(url: url, headers: videoSource.headers)
+        do {
+            _ = try engine.open()
+        } catch {
+            api.onError(error)
+            return
+        }
+        self.engine = engine
+        info = VideoInfo(height: Int(engine.videoHeight),
+                         width: Int(engine.videoWidth),
+                         duration: Int64(engine.durationSeconds * 1000))
+        displayLayer.flush()
+        if hasAudioRenderer {
+            synchronizer.removeRenderer(audioRenderer, at: nil)
+            hasAudioRenderer = false
+        }
+        audioRenderer.volume = volume
+        api.onPlaybackReady()
+    }
+
+    func getVideoInfo(completion: @escaping (VideoInfo) -> Void) {
+        completion(info)
+    }
+
+    func getPlaybackPosition() -> Int64 {
+        let t = synchronizer.currentTime()
+        guard t.isValid && !t.isIndefinite else { return 0 }
+        return Int64(t.seconds * 1000)
+    }
+
+    func play() {
+        guard engine != nil else { return }
+        endedNotified = false
+        if atEOF {
+            // Replay from the start, like the AVPlayer controller does.
+            seekTo(position: 0) { [weak self] in self?.startPump(rate: Float(self?.speed ?? 1)) }
+            return
+        }
+        startPump(rate: Float(speed))
+    }
+
+    func pause() {
+        rate = 0
+        synchronizer.setRate(0)
+    }
+
+    func stop(completion: @escaping () -> Void) {
+        rate = 0
+        synchronizer.setRate(0)
+        stopPump()
+        if let engine = engine {
+            _ = engine.seek(toTime: 0)
+        }
+        displayLayer.flush()
+        atEOF = false
+        completion()
+    }
+
+    func isPlaying() -> Bool {
+        rate != 0
+    }
+
+    func seekTo(position: Int64, completion: @escaping () -> Void) {
+        guard let engine = engine else { completion(); return }
+        let wasPlaying = rate != 0
+        let targetRate: Float = wasPlaying ? Float(speed) : 0
+        stopPump()
+        displayLayer.flush()
+        atEOF = false
+        endedNotified = false
+        pumpQueue.async { [weak self] in
+            guard let self = self else { return }
+            _ = engine.seek(toTime: Double(position) / 1000.0)
+            DispatchQueue.main.async {
+                completion()
+                if wasPlaying || targetRate != 0 {
+                    self.startPump(rate: targetRate)
+                }
+            }
+        }
+    }
+
+    func setPlaybackSpeed(speed: Double) {
+        self.speed = speed
+        // audioTimePitchAlgorithm needs iOS 16+; on 15.x the synchronizer
+        // rate still drives both renderers, just without pitch correction.
+        if #available(iOS 16.0, *) {
+            audioRenderer.audioTimePitchAlgorithm = .varispeed
+        }
+        if rate != 0 {
+            synchronizer.setRate(Float(speed))
+            rate = Float(speed)
+        }
+    }
+
+    func setVolume(volume: Double) {
+        self.volume = Float(volume)
+        audioRenderer.volume = self.volume
+    }
+
+    func setLoop(loop: Bool) {
+        self.loop = loop
+    }
+
+    // MARK: - pump
+
+    private func startPump(rate: Float) {
+        guard let engine = engine, !pumping else {
+            // Already pumping: just (re)set the clock rate.
+            if pumping { synchronizer.setRate(rate); self.rate = rate }
+            return
+        }
+        pumping = true
+        stopLock.withLock { stopFlag = false }
+        self.rate = rate
+        synchronizer.setRate(rate)
+
+        pumpQueue.async { [weak self] in
+            guard let self = self else { return }
+            engine.decode(
+                withVideo: { [weak self] pixelBuffer, pts, stop in
+                    guard let self = self else { stop.pointee = true; return }
+                    var shouldStop = false
+                    self.enqueueVideo(pixelBuffer: pixelBuffer, pts: pts, stop: &shouldStop)
+                    if shouldStop { stop.pointee = true }
+                },
+                audio: { [weak self] sampleBuffer, stop in
+                    guard let self = self else { stop.pointee = true; return }
+                    var shouldStop = false
+                    self.enqueueAudio(sampleBuffer: sampleBuffer, stop: &shouldStop)
+                    if shouldStop { stop.pointee = true }
+                },
+                completion: { [weak self] error in
+                    guard let self = self else { return }
+                    self.pumping = false
+                    DispatchQueue.main.async {
+                        if let error = error {
+                            self.rate = 0
+                            self.api.onError(error)
+                        } else {
+                            self.onStreamEnded()
+                        }
+                    }
+                }
+            )
+        }
+    }
+
+    private func stopPump() {
+        engine?.requestStop()
+        stopLock.withLock { stopFlag = true }
+        // The decode call returns on the pump queue; pumping flips false in
+        // its completion handler. Do not block the main thread waiting.
+        synchronizer.setRate(0)
+        rate = 0
+    }
+
+    private func teardownEngine() {
+        stopPump()
+        engine?.close()
+        engine = nil
+        pumping = false
+        stopLock.withLock { stopFlag = false }
+        displayLayer.flush()
+    }
+
+    /// Read on the pump thread; set on the main thread by stopPump/teardown.
+    private var stopRequested: Bool {
+        stopLock.withLock { stopFlag }
+    }
+
+    private func enqueueVideo(pixelBuffer: CVPixelBuffer?, pts: CMTime, stop: inout Bool) {
+        guard let pixelBuffer = pixelBuffer else { return }
+        // Backpressure: wait until the layer wants more data. This keeps
+        // memory bounded on long files and matches AVPlayer behaviour.
+        while !displayLayer.isReadyForMoreMediaData && !stopRequested {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if stopRequested { stop = true; return }
+
+        var format: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &format)
+        guard let format = format else { return }
+
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: pts.isValid ? pts : lastEnqueuedPTS,
+            decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        let st = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: format,
+            sampleTiming: &timing,
+            sampleBufferOut: &sample)
+        guard st == noErr, let sample = sample else { return }
+        lastEnqueuedPTS = timing.presentationTimeStamp
+
+        // Enqueue on the main thread: AVSampleBufferDisplayLayer is not
+        // thread-safe for enqueue from background queues.
+        DispatchQueue.main.sync {
+            if self.displayLayer.status == .failed {
+                stop = true
+                return
+            }
+            self.displayLayer.enqueue(sample)
+            // Prime the clock on the first frame so playback starts even if
+            // the app never calls play() with an explicit rate yet.
+            if self.synchronizer.rate == 0 && self.rate != 0 {
+                self.synchronizer.setRate(self.rate)
+            }
+        }
+    }
+    private func enqueueAudio(sampleBuffer: CMSampleBuffer?, stop: inout Bool) {
+        guard let sampleBuffer = sampleBuffer else { return }
+        if !hasAudioRenderer {
+            DispatchQueue.main.sync {
+                self.synchronizer.addRenderer(self.audioRenderer)
+                self.hasAudioRenderer = true
+            }
+        }
+        while !audioRenderer.isReadyForMoreMediaData {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        DispatchQueue.main.sync {
+            self.audioRenderer.enqueue(sampleBuffer)
+        }
+    }
+
+    private func onStreamEnded() {
+        atEOF = true
+        rate = 0
+        if loop {
+            seekTo(position: 0) { [weak self] in self?.startPump(rate: Float(self?.speed ?? 1)) }
+        } else if !endedNotified {
+            endedNotified = true
+            api.onPlaybackEnded()
+        }
+    }
+
+    @objc private func displayLayerFailed(_ note: Notification) {
+        let err = (note.userInfo?[AVSampleBufferDisplayLayerFailedToDecodeNotificationErrorKey] as? Error)
+            ?? NSError(domain: "AV1SoftwarePlayer", code: -10,
+                       userInfo: [NSLocalizedDescriptionKey: "display layer decode failure"]) as Error
+        rate = 0
+        api.onError(err)
+    }
+}

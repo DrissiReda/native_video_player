@@ -11,6 +11,17 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
     private var timeObserver: Any?
     private var timeControlObserver: NSKeyValueObservation?
 
+    // ADDITIVE (AV1 software path): when non-nil, this backend owns playback
+    // and every delegate method below forwards to it. When nil, the original
+    // AVPlayer code path runs byte-for-byte as before. The backend is engaged
+    // only for AV1 sources on devices without an AV1 hardware decoder.
+    private var swPlayer: AV1SoftwarePlayer?
+    private let probeQueue = DispatchQueue(label: "av1.probe", qos: .userInitiated)
+    // If play() arrives while the codec probe is still running, remember it
+    // and start playback as soon as the backend is ready.
+    private var pendingPlay = false
+    private var probeInFlight = false
+
     init(
         messenger: FlutterBinaryMessenger,
         viewId: Int64,
@@ -53,6 +64,90 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
 
 extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     func loadVideoSource(videoSource: VideoSource) {
+        // ADDITIVE dispatch: probe for AV1-without-hardware-decode off the
+        // main thread. Either branch below then runs the exact same code it
+        // always has — the AVPlayer branch is untouched.
+        probeInFlight = true
+        pendingPlay = false
+        probeQueue.async { [weak self] in
+            guard let self = self else { return }
+            let useSoftware = Self.needsSoftwareAV1(videoSource)
+            DispatchQueue.main.async {
+                self.probeInFlight = false
+                if useSoftware {
+                    self.loadVideoSourceSoftware(videoSource)
+                    if self.pendingPlay {
+                        self.pendingPlay = false
+                        self.swPlayer?.play()
+                    }
+                } else {
+                    self.deactivateSoftwarePlayer()
+                    self.loadVideoSourceNative(videoSource)
+                    if self.pendingPlay {
+                        self.pendingPlay = false
+                        self.play()
+                    }
+                }
+            }
+        }
+    }
+
+    // ADDITIVE: software AV1 backend.
+    private func loadVideoSourceSoftware(_ videoSource: VideoSource) {
+        // Park the AVPlayer so it holds no item and emits no callbacks.
+        removeOnVideoCompletedObserver()
+        player.replaceCurrentItem(with: nil)
+        removePeriodicTimeObserver()
+        timeControlObserver?.invalidate()
+        timeControlObserver = nil
+        lastPosition = -1
+
+        let sw: AV1SoftwarePlayer
+        if let existing = swPlayer {
+            sw = existing
+        } else {
+            sw = AV1SoftwarePlayer(api: api)
+            swPlayer = sw
+            // Cover the AVPlayer view; the player underneath stays idle.
+            sw.layer.frame = playerView.bounds
+            sw.layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            playerView.layer.addSublayer(sw.layer)
+        }
+        sw.loadVideoSource(videoSource: videoSource)
+    }
+
+    // ADDITIVE: return to the native backend (restores api.delegate).
+    private func deactivateSoftwarePlayer() {
+        if let sw = swPlayer {
+            sw.layer.removeFromSuperlayer()
+            swPlayer = nil
+        }
+        api.delegate = self
+    }
+
+    /// True only when the source is AV1 AND the device lacks an AV1 hardware
+    /// decoder. Conservative by design: any probe failure returns false so
+    /// playback falls back to the native path.
+    private static func needsSoftwareAV1(_ videoSource: VideoSource) -> Bool {
+        guard !AV1Capability.hasHardwareDecoder else { return false }
+        let isUrl = videoSource.type == .network
+        guard let url = isUrl ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else {
+            return false
+        }
+        // Probe through the same localhost proxy AVPlayer would use, so
+        // authentication/headers behave identically.
+        let probeURL: URL
+        if isUrl, #available(iOS 15.0, *), let proxy = VideoProxyServer.shared.proxyURL(for: url) {
+            probeURL = proxy
+        } else {
+            probeURL = url
+        }
+        var headers = HTTPCookie.requestHeaderFields(with: SwiftNativeVideoPlayerPlugin.cookieStorage?.cookies(for: url) ?? [:])
+        headers.merge(videoSource.headers) { _, new in new }
+        return GAV1Probe.isAV1(at: probeURL, headers: headers)
+    }
+
+    private func loadVideoSourceNative(_ videoSource: VideoSource) {
         let isUrl = videoSource.type == .network
         let sourcePath = videoSource.path
         guard let uri = isUrl ? URL(string: sourcePath) : URL(fileURLWithPath: sourcePath) else { return }
@@ -141,6 +236,12 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     }
     
     func play() {
+        // ADDITIVE: a play() landing while the codec probe is still running
+        // would hit the idle AVPlayer and get lost. Remember it instead.
+        if probeInFlight {
+            pendingPlay = true
+            return
+        }
         if player.currentItem?.currentTime() == player.currentItem?.duration {
             player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
         }

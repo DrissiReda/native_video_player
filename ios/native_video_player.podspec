@@ -13,12 +13,27 @@ A Flutter widget to play videos on iOS and Android using a native implementation
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'Alberto Malagoli' => 'albemala@gmail.com' }
   s.source           = { :path => '.' }
-  s.source_files = 'Classes/**/*'
+  s.source_files = 'Classes/**/*.{h,m,swift}'
   s.public_header_files = 'Classes/**/*.h'
   s.dependency 'Flutter'
 
-  s.platform = :ios, '9.0'
-  # Flutter.framework does not contain a i386 slice.
-  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386' }
+  s.platform = :ios, '15.0'
   s.swift_version = '5.0'
+
+  # ADDITIVE (AV1 software decode): minimal LGPL FFmpeg (libavformat,
+  # libavcodec, libavutil, libswscale, libswresample) + libdav1d, shipped as
+  # static XCFrameworks. Used ONLY by the AV1 software path
+  # (Classes/AV1/); the AVPlayer path links nothing new. LGPL compliance:
+  # FFmpeg was built --disable-gpl --disable-nonfree, dav1d is BSD-2; see
+  # THIRD-PARTY-LICENSES in this repo for the license texts and source offer.
+  s.vendored_frameworks = 'XCFrameworks/*.xcframework'
+  s.preserve_paths = 'XCFrameworks/**/*'
+  s.libraries = 'z', 'bz2', 'iconv', 'c++'
+  s.frameworks = 'AudioToolbox', 'CoreMedia', 'CoreVideo', 'VideoToolbox'
+  s.pod_target_xcconfig = {
+    'DEFINES_MODULE' => 'YES',
+    'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
+    'HEADER_SEARCH_PATHS' => '$(inherited) "${PODS_TARGET_SRCROOT}/XCFrameworks/Libavcodec.xcframework/ios-arm64/Headers" "${PODS_TARGET_SRCROOT}/XCFrameworks/Libavformat.xcframework/ios-arm64/Headers" "${PODS_TARGET_SRCROOT}/XCFrameworks/Libavutil.xcframework/ios-arm64/Headers" "${PODS_TARGET_SRCROOT}/XCFrameworks/Libswscale.xcframework/ios-arm64/Headers" "${PODS_TARGET_SRCROOT}/XCFrameworks/Libswresample.xcframework/ios-arm64/Headers" "${PODS_TARGET_SRCROOT}/XCFrameworks/Libdav1d.xcframework/ios-arm64/Headers"',
+    'OTHER_LDFLAGS' => '$(inherited) -lz -lbz2 -liconv -lc++',
+  }
 end

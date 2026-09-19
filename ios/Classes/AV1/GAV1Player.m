@@ -84,7 +84,7 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
             for (NSString *k in io->headers) [req setValue:io->headers[k] forHTTPHeaderField:k];
             __block int64_t len = -1;
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-            [[[io->session dataTaskWithRequest:req completionHandler:
+            [[io->session dataTaskWithRequest:req completionHandler:
                ^(NSData *d, NSURLResponse *r, NSError *e) {
                    if ([r isKindOfClass:[NSHTTPURLResponse class]]) {
                        NSString *cr = ((NSHTTPURLResponse *)r).allHeaderFields[@"Content-Range"];

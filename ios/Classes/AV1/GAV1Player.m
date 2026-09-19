@@ -145,9 +145,10 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
 - (void)dealloc { [self close]; }
 
 - (BOOL)open:(NSError **)error {
-    NSError *(^fail)(NSString *) = ^(NSString *msg) {
+    BOOL (^fail)(NSString *) = ^(NSString *msg) {
         if (error) *error = [NSError errorWithDomain:@"GAV1Player" code:-1
                              userInfo:@{NSLocalizedDescriptionKey: msg}];
+        return NO;
         return NO;
     };
 
@@ -228,10 +229,12 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
                     _swrRate = apar->sample_rate;
                 }
                 _swrCh = 2;
+                AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
+                AVChannelLayout inLayout = _adec->ch_layout;
                 swr_alloc_set_opts2(&_swr,
-                    &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
+                    &outLayout,
                     AV_SAMPLE_FMT_S16, _swrRate,
-                    &(AVChannelLayout)_adec->ch_layout,
+                    &inLayout,
                     _adec->sample_fmt, _adec->sample_rate,
                     0, NULL);
                 if (!_swr || swr_init(_swr) < 0) {
@@ -282,7 +285,7 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
     if (!_fmt || _vstream < 0) return NO;
     AVRational tb = _fmt->streams[_vstream]->time_base;
     int64_t ts = (int64_t)(seconds / av_q2d(tb));
-    if (avformat_seek_frame(_fmt, _vstream, ts, AVSEEK_FLAG_BACKWARD) < 0) return NO;
+    if (avformat_seek_file(_fmt, _vstream, INT64_MIN, ts, ts, AVSEEK_FLAG_BACKWARD) < 0) return NO;
     if (_vdec) avcodec_flush_buffers(_vdec);
     if (_adec) avcodec_flush_buffers(_adec);
     if (_swr) {

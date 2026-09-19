@@ -110,7 +110,6 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
             swPlayer = sw
             // Cover the AVPlayer view; the player underneath stays idle.
             sw.layer.frame = playerView.bounds
-            sw.layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
             playerView.layer.addSublayer(sw.layer)
         }
         sw.loadVideoSource(videoSource: videoSource)
@@ -142,7 +141,7 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
         } else {
             probeURL = url
         }
-        var headers = HTTPCookie.requestHeaderFields(with: SwiftNativeVideoPlayerPlugin.cookieStorage?.cookies(for: url) ?? [:])
+        var headers = HTTPCookie.requestHeaderFields(with: SwiftNativeVideoPlayerPlugin.cookieStorage?.cookies(for: url) ?? [])
         headers.merge(videoSource.headers) { _, new in new }
         return GAV1Probe.isAV1(at: probeURL, headers: headers)
     }

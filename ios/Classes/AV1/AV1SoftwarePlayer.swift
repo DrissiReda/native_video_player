@@ -55,7 +55,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         self.api = api
         super.init()
         api.delegate = self
-        displayLayer.videoGravity = .resizeAspectFit
+        displayLayer.videoGravity = .resizeAspect
         synchronizer.addRenderer(displayLayer)
         // Audio renderer is added lazily on first audio frame (sources
         // without audio must never add it: an idle audio renderer stalls
@@ -93,7 +93,11 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         sourceURL = url
         sourceHeaders = videoSource.headers
 
-        let engine = GAV1Player(url: url, headers: videoSource.headers)
+        guard let engine = GAV1Player(url: url, headers: videoSource.headers) else {
+            api.onError(NSError(domain: "AV1SoftwarePlayer", code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: "cannot create player"]) as Error)
+            return
+        }
         do {
             _ = try engine.open()
         } catch {
@@ -106,7 +110,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                          duration: Int64(engine.durationSeconds * 1000))
         displayLayer.flush()
         if hasAudioRenderer {
-            synchronizer.removeRenderer(audioRenderer, at: nil)
+            synchronizer.removeRenderer(audioRenderer, at: .zero)
             hasAudioRenderer = false
         }
         audioRenderer.volume = volume
@@ -213,7 +217,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         pumpQueue.async { [weak self] in
             guard let self = self else { return }
             engine.decode(
-                withVideo: { [weak self] pixelBuffer, pts, stop in
+                video: { [weak self] pixelBuffer, pts, stop in
                     guard let self = self else { stop.pointee = true; return }
                     var shouldStop = false
                     self.enqueueVideo(pixelBuffer: pixelBuffer, pts: pts, stop: &shouldStop)

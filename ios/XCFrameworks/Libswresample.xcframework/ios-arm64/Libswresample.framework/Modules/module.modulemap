@@ -1,0 +1,5 @@
+framework module Libswresample {
+  umbrella header "libswresample/swresample.h"
+  export *
+  link "Libswresample"
+}

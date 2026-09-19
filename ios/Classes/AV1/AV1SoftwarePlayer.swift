@@ -140,12 +140,12 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     func pause() {
         rate = 0
-        synchronizer.setRate(0)
+        synchronizer.setRate(0, time: synchronizer.currentTime())
     }
 
     func stop(completion: @escaping () -> Void) {
         rate = 0
-        synchronizer.setRate(0)
+        synchronizer.setRate(0, time: synchronizer.currentTime())
         stopPump()
         if let engine = engine {
             _ = engine.seek(toTime: 0)
@@ -187,7 +187,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             audioRenderer.audioTimePitchAlgorithm = .varispeed
         }
         if rate != 0 {
-            synchronizer.setRate(Float(speed))
+            synchronizer.setRate(Float(speed), time: synchronizer.currentTime())
             rate = Float(speed)
         }
     }
@@ -206,13 +206,13 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     private func startPump(rate: Float) {
         guard let engine = engine, !pumping else {
             // Already pumping: just (re)set the clock rate.
-            if pumping { synchronizer.setRate(rate); self.rate = rate }
+            if pumping { synchronizer.setRate(rate, time: synchronizer.currentTime()); self.rate = rate }
             return
         }
         pumping = true
         stopLock.withLock { stopFlag = false }
         self.rate = rate
-        synchronizer.setRate(rate)
+        synchronizer.setRate(rate, time: synchronizer.currentTime())
 
         pumpQueue.async { [weak self] in
             guard let self = self else { return }
@@ -250,7 +250,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         stopLock.withLock { stopFlag = true }
         // The decode call returns on the pump queue; pumping flips false in
         // its completion handler. Do not block the main thread waiting.
-        synchronizer.setRate(0)
+        synchronizer.setRate(0, time: synchronizer.currentTime())
         rate = 0
     }
 
@@ -307,7 +307,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             // Prime the clock on the first frame so playback starts even if
             // the app never calls play() with an explicit rate yet.
             if self.synchronizer.rate == 0 && self.rate != 0 {
-                self.synchronizer.setRate(self.rate)
+                self.synchronizer.setRate(self.rate, time: synchronizer.currentTime())
             }
         }
     }

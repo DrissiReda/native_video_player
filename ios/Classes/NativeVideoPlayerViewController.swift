@@ -64,21 +64,28 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
 
 extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     func loadVideoSource(videoSource: VideoSource) {
-        // ADDITIVE dispatch: probe for AV1-without-hardware-decode off the
-        // main thread. Either branch below then runs the exact same code it
-        // always has — the AVPlayer branch is untouched.
+        // ADDITIVE: on devices without an AV1 hardware decoder, try the
+        // software backend first — it validates AV1 itself and fails fast
+        // for anything else, in which case we run the original AVPlayer
+        // code below, untouched. Devices WITH hardware AV1 skip this
+        // entirely: zero behavior change.
+        guard !AV1Capability.hasHardwareDecoder else {
+            loadVideoSourceNative(videoSource)
+            return
+        }
         probeInFlight = true
         pendingPlay = false
         probeQueue.async { [weak self] in
             guard let self = self else { return }
-            let useSoftware = Self.needsSoftwareAV1(videoSource)
+            let sw = AV1SoftwarePlayer(api: self.api)
+            let opened = sw.tryOpen(videoSource)
             DispatchQueue.main.async {
                 self.probeInFlight = false
-                if useSoftware {
-                    self.loadVideoSourceSoftware(videoSource)
+                if opened {
+                    self.activateSoftware(sw, videoSource: videoSource)
                     if self.pendingPlay {
                         self.pendingPlay = false
-                        self.swPlayer?.play()
+                        sw.play()
                     }
                 } else {
                     self.deactivateSoftwarePlayer()
@@ -92,8 +99,8 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
         }
     }
 
-    // ADDITIVE: software AV1 backend.
-    private func loadVideoSourceSoftware(_ videoSource: VideoSource) {
+    // ADDITIVE: engage an already-opened software backend.
+    private func activateSoftware(_ sw: AV1SoftwarePlayer, videoSource: VideoSource) {
         // Park the AVPlayer so it holds no item and emits no callbacks.
         removeOnVideoCompletedObserver()
         player.replaceCurrentItem(with: nil)
@@ -102,16 +109,14 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
         timeControlObserver = nil
         lastPosition = -1
 
-        let sw: AV1SoftwarePlayer
-        if let existing = swPlayer {
-            sw = existing
-        } else {
-            sw = AV1SoftwarePlayer(api: api)
-            swPlayer = sw
-            // Cover the AVPlayer view; the player underneath stays idle.
-            sw.layer.frame = playerView.bounds
-            playerView.layer.addSublayer(sw.layer)
+        // Drop any previous SW backend (its layer and engine are released).
+        if let old = swPlayer {
+            old.layer.removeFromSuperlayer()
         }
+        swPlayer = sw
+        api.delegate = sw
+        sw.layer.frame = playerView.bounds
+        playerView.layer.addSublayer(sw.layer)
         sw.loadVideoSource(videoSource: videoSource)
     }
 
@@ -122,28 +127,6 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
             swPlayer = nil
         }
         api.delegate = self
-    }
-
-    /// True only when the source is AV1 AND the device lacks an AV1 hardware
-    /// decoder. Conservative by design: any probe failure returns false so
-    /// playback falls back to the native path.
-    private static func needsSoftwareAV1(_ videoSource: VideoSource) -> Bool {
-        guard !AV1Capability.hasHardwareDecoder else { return false }
-        let isUrl = videoSource.type == .network
-        guard let url = isUrl ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else {
-            return false
-        }
-        // Probe through the same localhost proxy AVPlayer would use, so
-        // authentication/headers behave identically.
-        let probeURL: URL
-        if isUrl, #available(iOS 15.0, *), let proxy = VideoProxyServer.shared.proxyURL(for: url) {
-            probeURL = proxy
-        } else {
-            probeURL = url
-        }
-        var headers = HTTPCookie.requestHeaderFields(with: SwiftNativeVideoPlayerPlugin.cookieStorage?.cookies(for: url) ?? [])
-        headers.merge(videoSource.headers) { _, new in new }
-        return GAV1Probe.isAV1(at: probeURL, headers: headers)
     }
 
     private func loadVideoSourceNative(_ videoSource: VideoSource) {

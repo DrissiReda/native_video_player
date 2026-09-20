@@ -54,7 +54,8 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     init(api: NativeVideoPlayerApi) {
         self.api = api
         super.init()
-        api.delegate = self
+        // NOTE: the controller assigns api.delegate = self only after
+        // tryOpen succeeds, so a failed probe never hijacks callbacks.
         displayLayer.videoGravity = .resizeAspect
         synchronizer.addRenderer(displayLayer)
         // Audio renderer is added lazily on first audio frame (sources
@@ -78,36 +79,45 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     // MARK: - NativeVideoPlayerApiDelegate
 
-    func loadVideoSource(videoSource: VideoSource) {
-        teardownEngine()
-        endedNotified = false
-        atEOF = false
-        lastEnqueuedPTS = .zero
-
+    /// Tries to open the source for software decode. Returns true only if
+    /// the source is AV1 and the engine opened cleanly. No api callbacks,
+    /// no delegate changes — safe to call speculatively from the controller.
+    /// Must be called off the main thread (does network/demux I/O).
+    func tryOpen(_ videoSource: VideoSource) -> Bool {
         let isURL = videoSource.type == .network
         guard let url = isURL ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else {
-            api.onError(NSError(domain: "AV1SoftwarePlayer", code: -1,
-                                userInfo: [NSLocalizedDescriptionKey: "invalid source URL"]) as Error)
-            return
+            return false
         }
-        sourceURL = url
-        sourceHeaders = videoSource.headers
-
         guard let engine = GAV1Player(url: url, headers: videoSource.headers) else {
-            api.onError(NSError(domain: "AV1SoftwarePlayer", code: -1,
-                                userInfo: [NSLocalizedDescriptionKey: "cannot create player"]) as Error)
-            return
+            return false
         }
         do {
             _ = try engine.open()
         } catch {
-            api.onError(error)
-            return
+            return false
         }
+        sourceURL = url
+        sourceHeaders = videoSource.headers
         self.engine = engine
         info = VideoInfo(height: Int(engine.videoHeight),
                          width: Int(engine.videoWidth),
                          duration: Int64(engine.durationSeconds * 1000))
+        return true
+    }
+
+    func loadVideoSource(videoSource: VideoSource) {
+        // Normal entry point once tryOpen succeeded: reset state and announce.
+        // (If tryOpen was skipped, open here; on failure report the error.)
+        if engine == nil {
+            guard tryOpen(videoSource) else {
+                api.onError(NSError(domain: "AV1SoftwarePlayer", code: -2,
+                                    userInfo: [NSLocalizedDescriptionKey: "cannot open source"]) as Error)
+                return
+            }
+        }
+        endedNotified = false
+        atEOF = false
+        lastEnqueuedPTS = .zero
         displayLayer.flush()
         if hasAudioRenderer {
             synchronizer.removeRenderer(audioRenderer, at: .zero)

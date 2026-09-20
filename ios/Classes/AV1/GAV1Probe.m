@@ -146,7 +146,7 @@ static AVFormatContext *gav1_open(NSURL *url, NSDictionary *headers) {
         io->position = 0;
     } else {
         NSURLSessionConfiguration *cfg =
-            [NSURLSessionConfiguration ephemeralSessionConfiguration];
+            [NSURLSessionConfiguration defaultSessionConfiguration];
         cfg.timeoutIntervalForRequest = 15;
         cfg.timeoutIntervalForResource = 30;
         io->session = [NSURLSession sessionWithConfiguration:cfg];

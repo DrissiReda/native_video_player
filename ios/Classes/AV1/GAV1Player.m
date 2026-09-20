@@ -167,7 +167,7 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
         _io->file = fh;
         _io->fileLength = (int64_t)len;
     } else {
-        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
         cfg.timeoutIntervalForRequest = 15;
         cfg.timeoutIntervalForResource = 60;
         // Concurrent range reads: the demuxer seeks while the pump reads.

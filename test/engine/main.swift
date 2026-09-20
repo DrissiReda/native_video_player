@@ -56,8 +56,13 @@ player.seekTo(position: 2000) { sema.signal() }
 if !spinWait(sema, timeout: 10) {
     print("WARN seek completion timeout")
 }
+print("INFO post-seek pos=\(player.getPlaybackPosition())ms")
 player.play()
-Thread.sleep(forTimeInterval: 2.0)
+// Let main-async completions run while waiting (sleep would stall them).
+let playEnd = Date().addingTimeInterval(2.0)
+while Date() < playEnd {
+    RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+}
 print("INFO after-seek pos=\(player.getPlaybackPosition())ms playing=\(player.isPlaying())")
 
 let sema2 = DispatchSemaphore(value: 0)

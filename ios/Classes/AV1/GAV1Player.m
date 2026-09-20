@@ -260,7 +260,12 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
     return YES;
 }
 
-- (int)videoWidth { return _vdec ? _vdec->width : 0; }
+- (int)videoWidth {
+    if (_vdec) NSLog("GAV1 opened: %dx%d fps=%.2f dur=%.2fs audio=%d vcodec=%d",
+                     _vdec->width, _vdec->height, [self fps], [self durationSeconds],
+                     _astream >= 0 ? 1 : 0, _vstream >= 0 ? _fmt->streams[_vstream]->codecpar->codec_id : -1);
+    return _vdec ? _vdec->width : 0;
+}
 - (int)videoHeight { return _vdec ? _vdec->height : 0; }
 - (double)durationSeconds {
     if (!_fmt) return 0;

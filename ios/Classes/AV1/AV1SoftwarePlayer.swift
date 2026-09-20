@@ -64,6 +64,14 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         // NOTE: the controller assigns api.delegate = self only after
         // tryOpen succeeds, so a failed probe never hijacks callbacks.
         displayLayer.videoGravity = .resizeAspect
+        // Drive the display layer from the shared clock. Without an explicit
+        // timebase the layer accepts enqueued frames but never presents them
+        // (black), because nothing advances its clock.
+        if #available(iOS 18.0, *) {
+            // On iOS 18+ the renderer's own timebase is authoritative.
+        } else {
+            displayLayer.controlTimebase = synchronizer.timebase
+        }
         synchronizer.addRenderer(displayLayer)
         // Audio renderer is added lazily on first audio frame (sources
         // without audio must never add it: an idle audio renderer stalls
@@ -314,6 +322,15 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     private func enqueueVideo(pixelBuffer: CVPixelBuffer?, pts: CMTime, stop: inout Bool) {
         guard let pixelBuffer = pixelBuffer else { return }
+        // Diagnostic: first frames + layer/clock state (Console.app, filter GAV1).
+        if videoFrameCount < 5 {
+            let t = self.synchronizer.currentTime()
+            NSLog("GAV1 frame=%lld pts=%.3fs syncRate=%.2f syncTime=%.3fs layerReady=%d layerStatus=%ld clockValid=%d",
+                  videoFrameCount, pts.seconds, self.synchronizer.rate, t.seconds,
+                  self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
+                  (long)self.displayLayer.status.rawValue,
+                  (t.isValid && !t.isIndefinite) ? 1 : 0)
+        }
         // Backpressure: wait until the layer wants more data. This keeps
         // memory bounded on long files and matches AVPlayer behaviour.
         while !displayLayer.isReadyForMoreMediaData && !stopRequested {

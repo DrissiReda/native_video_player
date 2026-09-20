@@ -85,6 +85,7 @@ jobs:
 
       - name: compile swift driver
         run: |
+          export CPATH="$PWD/deps/include:$PWD/ios/Classes/AV1"
           swiftc -O \
             -Ideps/include -Iios/Classes/AV1 \
             -Xcc -Ideps/include \

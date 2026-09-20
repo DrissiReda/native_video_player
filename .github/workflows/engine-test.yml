@@ -72,7 +72,7 @@ jobs:
       - name: compile harness
         run: |
           clang -O2 -fobjc-arc \
-            -Ideps/include \
+            -Ideps/include -Iios/Classes/AV1 \
             test/engine/main.m ios/Classes/AV1/GAV1Player.m \
             -Ldeps/lib -lavformat -lavcodec -lswscale -lswresample -lavutil -ldav1d \
             -framework Foundation -framework CoreMedia -framework CoreVideo \

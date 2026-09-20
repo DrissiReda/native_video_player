@@ -360,14 +360,12 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
     if (got <= 0) { av_free(pcm); return NULL; }
 
     if (!_adesc) {
-        AudioChannelLayout layout;
-        memset(&layout, 0, sizeof(layout));
-        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
-        CMAudioFormatDescriptionCreate(kCFAllocatorDefault, kAudioFormatLinearPCM,
-            sizeof(layout), &layout, 0, NULL, NULL, &_adesc);
         // Describe S16 stereo at our rate via the basic ASBD in the desc.
         // AVSampleBufferAudioRenderer accepts LPCM sample buffers whose
         // format matches the enclosing description's mFormatID/mChannels.
+        AudioChannelLayout layout;
+        memset(&layout, 0, sizeof(layout));
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
         AudioStreamBasicDescription asbd;
         memset(&asbd, 0, sizeof(asbd));
         asbd.mSampleRate = _swrRate;
@@ -379,7 +377,7 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
         asbd.mChannelsPerFrame = 2;
         asbd.mBitsPerChannel = 16;
         CMAudioFormatDescriptionRef full = NULL;
-        if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &full) == noErr) {
+        if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, sizeof(layout), &layout, 0, NULL, NULL, &full) == noErr) {
             if (_adesc) CFRelease(_adesc);
             _adesc = full;
         }

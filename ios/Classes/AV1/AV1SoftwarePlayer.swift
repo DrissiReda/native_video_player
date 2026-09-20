@@ -206,6 +206,12 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         let targetRate: Float = wasPlaying ? Float(speed) : 0
         stopPump()
         displayLayer.flush()
+        // Re-anchor the render clock to the seek target. Without this the
+        // synchronizer keeps the pre-seek time, so freshly decoded frames
+        // (whose PTS restart at the target) arrive "late" and are never
+        // presented (black) while the position readout goes stale.
+        synchronizer.setRate(0, time: CMTime(seconds: Double(position) / 1000.0,
+                                             preferredTimescale: 600))
         atEOF = false
         endedNotified = false
         // Restart the synthesis baseline from the seek target so invalid

@@ -41,18 +41,28 @@ for i in 1...8 {
     print("INFO t=\(i)s pos=\(pos)ms playing=\(player.isPlaying())")
 }
 
-// Seek back to 2s and play again briefly.
+// Seek back to 2s and play again briefly. Completions land on the main
+// thread, so spin the runloop while waiting (blocking it deadlocks).
+func spinWait(_ sema: DispatchSemaphore, timeout: TimeInterval) -> Bool {
+    let end = Date().addingTimeInterval(timeout)
+    while sema.wait(timeout: .now()) == .timedOut {
+        if Date() > end { return false }
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    return true
+}
 let sema = DispatchSemaphore(value: 0)
 player.seekTo(position: 2000) { sema.signal() }
-if sema.wait(timeout: .now() + 10) == .timedOut {
+if !spinWait(sema, timeout: 10) {
     print("WARN seek completion timeout")
 }
+player.play()
 Thread.sleep(forTimeInterval: 2.0)
 print("INFO after-seek pos=\(player.getPlaybackPosition())ms playing=\(player.isPlaying())")
 
 let sema2 = DispatchSemaphore(value: 0)
 player.stop { sema2.signal() }
-if sema2.wait(timeout: .now() + 10) == .timedOut {
+if !spinWait(sema2, timeout: 10) {
     print("WARN stop completion timeout")
 }
 print("RESULT SWIFT-CLEAN")

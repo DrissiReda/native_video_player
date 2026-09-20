@@ -1,0 +1,98 @@
+name: engine-test
+# Headless test of the AV1 software-decode engine (GAV1Player.m) on real
+# Apple hardware. Builds minimal FFmpeg+dav1d natively, compiles the engine
+# + test/engine/main.m with Xcode clang, decodes the bundled AV1 sample and
+# stresses the teardown path that crashed on device. No signing, no device.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [av1-sw-decode]
+    paths:
+      - 'ios/Classes/AV1/**'
+      - 'test/engine/**'
+      - '.github/workflows/engine-test.yml'
+
+jobs:
+  engine:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: av1-sw-decode
+
+      - name: deps
+        run: brew install meson ninja nasm pkg-config
+
+      - name: fetch sources
+        run: |
+          curl -sL -o dav1d.tar.xz https://downloads.videolan.org/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz
+          curl -sL -o ffmpeg.tar.xz https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
+          mkdir -p src && tar -xf dav1d.tar.xz -C src && tar -xf ffmpeg.tar.xz -C src
+          ls src/
+
+      - name: build dav1d
+        run: |
+          meson setup build-dav1d src/dav1d-1.5.4 \
+            --prefix "$PWD/deps" --default-library=static --buildtype=release \
+            -Denable_tools=false -Denable_examples=false -Denable_tests=false \
+            "-Dbitdepths=['8', '16']"
+          ninja -C build-dav1d -j"$(sysctl -n hw.ncpu)"
+          ninja -C build-dav1d install
+
+      - name: build ffmpeg (minimal, LGPL)
+        run: |
+          export PKG_CONFIG_PATH="$PWD/deps/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PWD/deps/lib/pkgconfig"
+          mkdir -p build-ffmpeg && cd build-ffmpeg
+          ../src/ffmpeg-7.1.1/configure \
+            --prefix="$PWD/../deps" \
+            --target-os=darwin --arch=arm64 \
+            --cc="clang" --enable-pic \
+            --extra-cflags="-O3 -DHAVE_FORK=0 -I$PWD/../deps/include" \
+            --extra-ldflags="-L$PWD/../deps/lib" \
+            --enable-static --disable-shared \
+            --disable-autodetect --disable-doc --disable-programs \
+            --disable-avdevice --disable-postproc --disable-avfilter \
+            --disable-network --disable-hwaccels \
+            --disable-encoders --disable-muxers \
+            --disable-decoders --disable-parsers --disable-bsfs \
+            --disable-devices --disable-filters \
+            --disable-gpl --disable-nonfree \
+            --enable-swscale --enable-swresample \
+            --enable-decoder=libdav1d --enable-decoder=aac --enable-decoder=opus \
+            --enable-parser=av1 --enable-parser=aac --enable-parser=opus \
+            --enable-demuxer=mov --enable-demuxer=matroska \
+            --enable-protocol=file --enable-protocol=pipe --enable-protocol=data \
+            --enable-bsf=extract_extradata --enable-bsf=aac_adtstoasc \
+            --enable-libdav1d
+          make -j"$(sysctl -n hw.ncpu)" >/dev/null
+          make install
+
+      - name: compile harness
+        run: |
+          clang -O2 -fobjc-arc \
+            -Ideps/include \
+            test/engine/main.m ios/Classes/AV1/GAV1Player.m \
+            -Ldeps/lib -lavformat -lavcodec -lswscale -lswresample -lavutil -ldav1d \
+            -framework Foundation -framework CoreMedia -framework CoreVideo \
+            -framework VideoToolbox -framework AudioToolbox \
+            -o av1harness
+          ls -la av1harness
+
+      - name: run harness
+        run: ./av1harness test/engine/sample.mp4 | tee result.log
+
+      - name: upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-result
+          path: result.log
+
+      - name: upload crash reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-reports
+          path: ~/Library/Logs/DiagnosticReports/

@@ -86,7 +86,8 @@ jobs:
       - name: compile swift driver
         run: |
           swiftc -O \
-            -Ideps/include \
+            -Ideps/include -Iios/Classes/AV1 \
+            -import-objc-header test/engine/Bridging.h \
             test/engine/FlutterStubs.swift \
             ios/Classes/PlatformInterface/VideoSourceType.swift \
             ios/Classes/PlatformInterface/VideoSource.swift \

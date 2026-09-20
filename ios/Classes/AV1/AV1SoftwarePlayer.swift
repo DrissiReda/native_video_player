@@ -397,7 +397,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         }
         if failed {
             stop = true
-            _stop = true
         }
     }
     private func enqueueAudio(sampleBuffer: CMSampleBuffer?, stop: inout Bool) {

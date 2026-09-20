@@ -106,7 +106,7 @@ jobs:
           ls -la swimdriver
 
       - name: run swift driver
-        run: ./swimdriver test/engine/sample.mp4 | tee -a result.log
+        run: ./swimdriver test/engine/sample.mp4 2>&1 | tee -a result.log
 
       - name: upload result
         if: always()

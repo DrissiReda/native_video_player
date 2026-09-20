@@ -149,13 +149,11 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     func pause() {
-        rate = 0
-        synchronizer.setRate(0, time: synchronizer.currentTime())
+        setSyncRate(0)
     }
 
     func stop(completion: @escaping () -> Void) {
-        rate = 0
-        synchronizer.setRate(0, time: synchronizer.currentTime())
+        setSyncRate(0)
         stopPump()
         if let engine = engine {
             _ = engine.seek(toTime: 0)
@@ -197,8 +195,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             audioRenderer.audioTimePitchAlgorithm = .varispeed
         }
         if rate != 0 {
-            synchronizer.setRate(Float(speed), time: synchronizer.currentTime())
-            rate = Float(speed)
+            setSyncRate(Float(speed))
         }
     }
 
@@ -213,16 +210,25 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     // MARK: - pump
 
+    /// Sets the synchronizer rate, falling back to time zero when the clock
+    /// has no valid current time yet (fresh synchronizer, no frames enqueued).
+    /// A setRate with an invalid time fails silently and leaves the clock
+    /// stopped — which presents as black frames.
+    private func setSyncRate(_ rate: Float) {
+        let t = synchronizer.currentTime()
+        synchronizer.setRate(rate, time: (t.isValid && !t.isIndefinite) ? t : .zero)
+        self.rate = rate
+    }
+
     private func startPump(rate: Float) {
         guard let engine = engine, !pumping else {
             // Already pumping: just (re)set the clock rate.
-            if pumping { synchronizer.setRate(rate, time: synchronizer.currentTime()); self.rate = rate }
+            if pumping { setSyncRate(rate) }
             return
         }
         pumping = true
         stopLock.withLock { stopFlag = false }
-        self.rate = rate
-        synchronizer.setRate(rate, time: synchronizer.currentTime())
+        setSyncRate(rate)
 
         pumpQueue.async { [weak self] in
             guard let self = self else { return }
@@ -260,8 +266,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         stopLock.withLock { stopFlag = true }
         // The decode call returns on the pump queue; pumping flips false in
         // its completion handler. Do not block the main thread waiting.
-        synchronizer.setRate(0, time: synchronizer.currentTime())
-        rate = 0
+        setSyncRate(0)
     }
 
     private func teardownEngine() {
@@ -317,7 +322,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             // Prime the clock on the first frame so playback starts even if
             // the app never calls play() with an explicit rate yet.
             if self.synchronizer.rate == 0 && self.rate != 0 {
-                self.synchronizer.setRate(self.rate, time: synchronizer.currentTime())
+                self.setSyncRate(self.rate)
             }
         }
     }

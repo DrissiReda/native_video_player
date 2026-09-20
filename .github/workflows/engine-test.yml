@@ -83,6 +83,28 @@ jobs:
       - name: run harness
         run: ./av1harness test/engine/sample.mp4 | tee result.log
 
+      - name: compile swift driver
+        run: |
+          swiftc -O \
+            -Ideps/include \
+            test/engine/FlutterStubs.swift \
+            ios/Classes/PlatformInterface/VideoSourceType.swift \
+            ios/Classes/PlatformInterface/VideoSource.swift \
+            ios/Classes/PlatformInterface/VideoInfo.swift \
+            ios/Classes/PlatformInterface/NativeVideoPlayerApi.swift \
+            ios/Classes/AV1/AV1Capability.swift \
+            ios/Classes/AV1/AV1SoftwarePlayer.swift \
+            test/engine/driver.swift \
+            ios/Classes/AV1/GAV1Player.m \
+            -Ldeps/lib -lavformat -lavcodec -lswscale -lswresample -lavutil -ldav1d \
+            -framework Foundation -framework AVFoundation -framework CoreMedia \
+            -framework CoreVideo -framework VideoToolbox -framework AudioToolbox \
+            -o swimdriver
+          ls -la swimdriver
+
+      - name: run swift driver
+        run: ./swimdriver test/engine/sample.mp4 | tee -a result.log
+
       - name: upload result
         if: always()
         uses: actions/upload-artifact@v4

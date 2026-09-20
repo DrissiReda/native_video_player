@@ -87,6 +87,7 @@ jobs:
         run: |
           swiftc -O \
             -Ideps/include -Iios/Classes/AV1 \
+            -Xcc -Ideps/include \
             -import-objc-header test/engine/Bridging.h \
             test/engine/FlutterStubs.swift \
             ios/Classes/PlatformInterface/VideoSourceType.swift \

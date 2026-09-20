@@ -94,7 +94,7 @@ jobs:
             ios/Classes/PlatformInterface/NativeVideoPlayerApi.swift \
             ios/Classes/AV1/AV1Capability.swift \
             ios/Classes/AV1/AV1SoftwarePlayer.swift \
-            test/engine/driver.swift \
+            test/engine/main.swift \
             ios/Classes/AV1/GAV1Player.m \
             -Ldeps/lib -lavformat -lavcodec -lswscale -lswresample -lavutil -ldav1d \
             -framework Foundation -framework AVFoundation -framework CoreMedia \

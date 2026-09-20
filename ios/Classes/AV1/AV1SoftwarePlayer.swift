@@ -33,6 +33,11 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     private var sourceURL: URL?
     private var sourceHeaders: [String: String] = [:]
     private let pumpQueue = DispatchQueue(label: "av1.software.pump", qos: .userInitiated)
+    // All AVSampleBuffer* enqueue/addRenderer calls go through this serial
+    // queue. Using DispatchQueue.main.sync from the decode callbacks risked
+    // deadlocking with the main thread (play/seek/teardown), which the
+    // watchdog kills; a private queue removes that coupling entirely.
+    private let enqueueQueue = DispatchQueue(label: "av1.software.enqueue", qos: .userInitiated)
     private var pumping = false
     private var atEOF = false
     private var lastEnqueuedPTS = CMTime.zero
@@ -47,6 +52,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     // out of the backpressure waits below. NSLock-guarded: written from the
     // main thread (stopPump/teardown/load), read from the pump thread.
     private var stopFlag = false
+    private var pumpActive = false
     private let stopLock = NSLock()
 
     // MARK: - state (mirrors AVPlayer controller semantics)
@@ -86,7 +92,13 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        teardownEngine()
+        // deinit can run on any thread; never block here. Just signal stop
+        // and free the engine (the pump may still be unwinding, so this
+        // branch is avoided in the normal controller flow by an explicit
+        // teardown before release).
+        engine?.requestStop()
+        engine?.close()
+        engine = nil
     }
 
     /// The layer the platform view must display instead of the AVPlayerLayer.
@@ -99,6 +111,9 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     /// no delegate changes — safe to call speculatively from the controller.
     /// Must be called off the main thread (does network/demux I/O).
     func tryOpen(_ videoSource: VideoSource) -> Bool {
+        // Never leak a previous engine (defensive; the controller currently
+        // creates a fresh instance per load).
+        if engine != nil { teardownEngine() }
         let isURL = videoSource.type == .network
         guard let url = isURL ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else {
             return false
@@ -249,7 +264,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             return
         }
         pumping = true
-        stopLock.withLock { stopFlag = false }
+        stopLock.withLock { stopFlag = false; pumpActive = true }
         setSyncRate(rate)
 
         pumpQueue.async { [weak self] in
@@ -270,6 +285,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 completion: { [weak self] error in
                     guard let self = self else { return }
                     self.pumping = false
+                    self.stopLock.withLock { self.pumpActive = false }
                     DispatchQueue.main.async {
                         if let error = error {
                             self.rate = 0
@@ -292,11 +308,18 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     private func teardownEngine() {
+        // Ask the pump to stop, then WAIT for it to finish before freeing
+        // the engine. Closing while the decode loop is mid-frame frees
+        // _vdec/_fmt/_sws underneath it and crashes.
         stopPump()
+        // Bounded wait: the decode loop checks the stop flag between every
+        // packet/frame, so this returns promptly.
+        let deadline = Date().addingTimeInterval(2.0)
+        while stopLock.withLock({ pumpActive }) && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
         engine?.close()
         engine = nil
-        pumping = false
-        stopLock.withLock { stopFlag = false }
         displayLayer.flush()
     }
 
@@ -357,11 +380,12 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         guard st == noErr, let sample = sample else { return }
         lastEnqueuedPTS = timing.presentationTimeStamp
 
-        // Enqueue on the main thread: AVSampleBufferDisplayLayer is not
-        // thread-safe for enqueue from background queues.
-        DispatchQueue.main.sync {
+        // Serialize on our own queue (never the main thread: the pump can be
+        // started from main, so main.sync here deadlocks and gets killed).
+        var failed = false
+        enqueueQueue.sync {
             if self.displayLayer.status == .failed {
-                stop = true
+                failed = true
                 return
             }
             self.displayLayer.enqueue(sample)
@@ -371,19 +395,24 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 self.setSyncRate(self.rate)
             }
         }
+        if failed {
+            stop = true
+            _stop = true
+        }
     }
     private func enqueueAudio(sampleBuffer: CMSampleBuffer?, stop: inout Bool) {
         guard let sampleBuffer = sampleBuffer else { return }
         if !hasAudioRenderer {
-            DispatchQueue.main.sync {
+            enqueueQueue.sync {
                 self.synchronizer.addRenderer(self.audioRenderer)
                 self.hasAudioRenderer = true
             }
         }
-        while !audioRenderer.isReadyForMoreMediaData {
+        while !audioRenderer.isReadyForMoreMediaData && !stopRequested {
             Thread.sleep(forTimeInterval: 0.01)
         }
-        DispatchQueue.main.sync {
+        if stopRequested { stop = true; return }
+        enqueueQueue.sync {
             self.audioRenderer.enqueue(sampleBuffer)
         }
     }

@@ -172,6 +172,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     func play() {
         guard engine != nil else { return }
+        NSLog("GAV1DBG play atEOF=%d rate=%.2f pumping=%d clock=%.3f", atEOF ? 1 : 0, rate, pumping ? 1 : 0, synchronizer.currentTime().seconds)
         endedNotified = false
         if atEOF {
             // Replay from the start, like the AVPlayer controller does.
@@ -220,7 +221,8 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         lastEnqueuedPTS = .zero
         pumpQueue.async { [weak self] in
             guard let self = self else { return }
-            _ = engine.seek(toTime: Double(position) / 1000.0)
+            let ok = engine.seek(toTime: Double(position) / 1000.0)
+            NSLog("GAV1DBG seek engine.seek(%.2f) -> %d", Double(position) / 1000.0, ok ? 1 : 0)
             DispatchQueue.main.async {
                 completion()
                 if wasPlaying || targetRate != 0 {

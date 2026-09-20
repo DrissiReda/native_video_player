@@ -26,3 +26,5 @@ class FlutterMethodChannel {
     func setMethodCallHandler(_ handler: ((FlutterMethodCall, @escaping FlutterResult) -> Void)?) {}
     func invokeMethod(_ method: String, arguments: Any?) {}
 }
+
+let FlutterMethodNotImplemented: Any? = nil

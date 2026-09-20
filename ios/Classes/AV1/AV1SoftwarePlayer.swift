@@ -36,6 +36,13 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     private var pumping = false
     private var atEOF = false
     private var lastEnqueuedPTS = CMTime.zero
+    // Frames enqueued since load/seek. Used to synthesize PTS when the
+    // decoder emits frames with invalid timestamps (dav1d can do this for
+    // the first frames due to internal delay): without this, every frame
+    // stamps at zero, flashes by instantly, then the screen goes black
+    // while audio (which has valid PTS) plays normally.
+    private var videoFrameCount: Int64 = 0
+    private var videoFPS: Double = 0
     // Set when teardown/stop is requested; read on the pump thread to break
     // out of the backpressure waits below. NSLock-guarded: written from the
     // main thread (stopPump/teardown/load), read from the pump thread.
@@ -102,6 +109,8 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         info = VideoInfo(height: Int(engine.videoHeight),
                          width: Int(engine.videoWidth),
                          duration: Int64(engine.durationSeconds * 1000))
+        videoFPS = engine.fps > 0 ? engine.fps : 30
+        videoFrameCount = 0
         return true
     }
 
@@ -118,6 +127,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         endedNotified = false
         atEOF = false
         lastEnqueuedPTS = .zero
+        videoFrameCount = 0
         displayLayer.flush()
         if hasAudioRenderer {
             synchronizer.removeRenderer(audioRenderer, at: .zero)
@@ -175,6 +185,10 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         displayLayer.flush()
         atEOF = false
         endedNotified = false
+        // Restart the synthesis baseline from the seek target so invalid
+        // PTS after a seek still paces correctly.
+        videoFrameCount = Int64((Double(position) / 1000.0) * max(videoFPS, 1))
+        lastEnqueuedPTS = .zero
         pumpQueue.async { [weak self] in
             guard let self = self else { return }
             _ = engine.seek(toTime: Double(position) / 1000.0)
@@ -283,6 +297,21 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         stopLock.withLock { stopFlag }
     }
 
+    /// Resolves the PTS to enqueue for a frame. Prefers the container
+    /// timestamp; when the decoder emits an invalid one (dav1d delay),
+    /// synthesizes from the frame count and fps so frames pace correctly
+    /// instead of all stamping at zero (flash-fast then black).
+    private func presentationPTS(for pts: CMTime) -> CMTime {
+        defer { videoFrameCount += 1 }
+        if pts.isValid && !pts.isIndefinite {
+            lastEnqueuedPTS = pts
+            return pts
+        }
+        let synth = CMTimeMakeWithSeconds(Double(videoFrameCount) / max(videoFPS, 1), preferredTimescale: 600)
+        lastEnqueuedPTS = synth
+        return synth
+    }
+
     private func enqueueVideo(pixelBuffer: CVPixelBuffer?, pts: CMTime, stop: inout Bool) {
         guard let pixelBuffer = pixelBuffer else { return }
         // Backpressure: wait until the layer wants more data. This keeps
@@ -299,7 +328,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
         var timing = CMSampleTimingInfo(
             duration: .invalid,
-            presentationTimeStamp: pts.isValid ? pts : lastEnqueuedPTS,
+            presentationTimeStamp: presentationPTS(for: pts),
             decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
         let st = CMSampleBufferCreateReadyWithImageBuffer(

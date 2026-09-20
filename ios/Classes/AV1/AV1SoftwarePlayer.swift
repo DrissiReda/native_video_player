@@ -328,7 +328,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             NSLog("GAV1 frame=%lld pts=%.3fs syncRate=%.2f syncTime=%.3fs layerReady=%d layerStatus=%ld clockValid=%d",
                   videoFrameCount, pts.seconds, self.synchronizer.rate, t.seconds,
                   self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
-                  (long)self.displayLayer.status.rawValue,
+                  Int(self.displayLayer.status.rawValue),
                   (t.isValid && !t.isIndefinite) ? 1 : 0)
         }
         // Backpressure: wait until the layer wants more data. This keeps

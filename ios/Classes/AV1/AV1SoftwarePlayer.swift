@@ -259,6 +259,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     /// stopped — which presents as black frames.
     private func setSyncRate(_ rate: Float) {
         let t = synchronizer.currentTime()
+        NSLog("GAV1DBG setSyncRate(%.2f) clock=%.3f", rate, t.seconds)
         synchronizer.setRate(rate, time: (t.isValid && !t.isIndefinite) ? t : .zero)
         self.rate = rate
     }

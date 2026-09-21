@@ -86,4 +86,11 @@ if !spinWait(sema2, timeout: 10) {
     print("FAIL stop completion timeout")
     exit(1)
 }
+
+// H264 probe must fail CLEANLY (no crash, returns false) — the controller
+// runs tryOpen for every video, including non-AV1.
+let h264 = VideoSource(from: ["path": "test/engine/h264.mp4", "type": "file", "headers": [:] as [String: String]])!
+let hp = AV1SoftwarePlayer(api: api)
+let h264open = hp.tryOpen(h264)
+print("INFO h264 tryOpen -> \(h264open) (expect false)")
 print("RESULT SWIFT-CLEAN")

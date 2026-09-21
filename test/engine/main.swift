@@ -93,4 +93,11 @@ let h264 = VideoSource(from: ["path": "test/engine/h264.mp4", "type": "file", "h
 let hp = AV1SoftwarePlayer(api: api)
 let h264open = hp.tryOpen(h264)
 print("INFO h264 tryOpen -> \(h264open) (expect false)")
+
+// NETWORK probe (the device streams everything over https): open + probe
+// the AV1 sample through HTTP range reads. Must not crash.
+let net = VideoSource(from: ["path": "http://127.0.0.1:8471/sample.mp4", "type": "network", "headers": [:] as [String: String]])!
+let np = AV1SoftwarePlayer(api: api)
+let netopen = np.tryOpen(net)
+print("INFO net tryOpen -> \(netopen) (expect true)")
 print("RESULT SWIFT-CLEAN")

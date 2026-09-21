@@ -43,6 +43,17 @@ for i in 1...4 {
     print("INFO t=\(i)s pos=\(player.getPlaybackPosition())ms playing=\(player.isPlaying())")
 }
 
+// Completions land on the main thread, so spin the runloop while
+// waiting (blocking it deadlocks).
+func spinWait(_ sema: DispatchSemaphore, timeout: TimeInterval) -> Bool {
+    let end = Date().addingTimeInterval(timeout)
+    while sema.wait(timeout: .now()) == .timedOut {
+        if Date() > end { return false }
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    return true
+}
+
 // Single seek mid-playback (the normal user flow): clock must re-anchor.
 let sema = DispatchSemaphore(value: 0)
 player.seekTo(position: 2000) { sema.signal() }

@@ -9,20 +9,7 @@
     return [dirs.firstObject stringByAppendingPathComponent:@"av1debug.log"];
 }
 
-+ (void)log:(NSString *)format, ... {
-    va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-
-    static NSDateFormatter *fmt = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fmt = [[NSDateFormatter alloc] init];
-        fmt.dateFormat = @"HH:mm:ss.SSS";
-    });
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [fmt stringFromDate:[NSDate date]], msg];
-
++ (void)line:(NSString *)line {
     static NSObject *lock = nil;
     static dispatch_once_t once2;
     dispatch_once(&once2, ^{ lock = [NSObject new]; });
@@ -47,6 +34,22 @@
             }
         }
     }
+}
+
++ (void)log:(NSString *)format, ... {
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss.SSS";
+    });
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [fmt stringFromDate:[NSDate date]], msg];
+    [self line:line];
 }
 
 @end

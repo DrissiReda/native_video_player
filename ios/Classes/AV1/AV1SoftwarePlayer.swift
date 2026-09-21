@@ -111,7 +111,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     /// no delegate changes — safe to call speculatively from the controller.
     /// Must be called off the main thread (does network/demux I/O).
     func tryOpen(_ videoSource: VideoSource) -> Bool {
-        GAV1FileLog.log("sw tryOpen path=%@", videoSource.path)
+        GAV1FileLog.line(String(format: "sw tryOpen path=%@", videoSource.path))
         // Never leak a previous engine (defensive; the controller currently
         // creates a fresh instance per load).
         if engine != nil { teardownEngine() }
@@ -127,7 +127,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         } catch {
             return false
         }
-        GAV1FileLog.log("sw tryOpen -> true %dx%d", Int(engine.videoWidth), Int(engine.videoHeight))
+        GAV1FileLog.line(String(format: "sw tryOpen -> true %dx%d", Int(engine.videoWidth), Int(engine.videoHeight)))
         sourceURL = url
         sourceHeaders = videoSource.headers
         self.engine = engine
@@ -173,7 +173,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     func play() {
-        GAV1FileLog.log("sw play")
+        GAV1FileLog.line("sw play")
         guard engine != nil else { return }
         endedNotified = false
         if atEOF {
@@ -185,12 +185,12 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     func pause() {
-        GAV1FileLog.log("sw pause")
+        GAV1FileLog.line("sw pause")
         setSyncRate(0)
     }
 
     func stop(completion: @escaping () -> Void) {
-        GAV1FileLog.log("sw stop")
+        GAV1FileLog.line("sw stop")
         setSyncRate(0)
         stopPump()
         if let engine = engine {
@@ -206,7 +206,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     func seekTo(position: Int64, completion: @escaping () -> Void) {
-        GAV1FileLog.log("sw seekTo %lld", position)
+        GAV1FileLog.line(String(format: "sw seekTo %lld", position))
         guard let engine = engine else { completion(); return }
         let wasPlaying = rate != 0
         let targetRate: Float = wasPlaying ? Float(speed) : 0
@@ -298,7 +298,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                     guard let self = self else { return }
                     self.pumping = false
                     self.stopLock.withLock { self.pumpActive = false }
-                    GAV1FileLog.log("sw pump done err=%@", error?.localizedDescription ?? "nil")
+                    GAV1FileLog.line(String(format: "sw pump done err=%@", error?.localizedDescription ?? "nil"))
                     DispatchQueue.main.async {
                         if let error = error {
                             self.rate = 0
@@ -321,7 +321,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     private func teardownEngine() {
-        GAV1FileLog.log("sw teardown")
+        GAV1FileLog.line("sw teardown")
         // Ask the pump to stop, then WAIT for it to finish before freeing
         // the engine. Closing while the decode loop is mid-frame frees
         // _vdec/_fmt/_sws underneath it and crashes.
@@ -431,7 +431,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     private func onStreamEnded() {
-        GAV1FileLog.log("sw ended")
+        GAV1FileLog.line("sw ended")
         atEOF = true
         rate = 0
         if loop {
@@ -443,7 +443,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     @objc private func displayLayerFailed(_ note: Notification) {
-        GAV1FileLog.log("sw layer FAILED")
+        GAV1FileLog.line("sw layer FAILED")
         let err = (note.userInfo?[AVSampleBufferDisplayLayerFailedToDecodeNotificationErrorKey] as? Error)
             ?? NSError(domain: "AV1SoftwarePlayer", code: -10,
                        userInfo: [NSLocalizedDescriptionKey: "display layer decode failure"]) as Error

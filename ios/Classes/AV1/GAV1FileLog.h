@@ -13,6 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)log:(NSString *)format, ... NS_FORMAT_FUNCTION(1, 2);
 /// Absolute path of the log file (for "reveal in Files" UI, if ever needed).
 + (NSString *)logPath;
++ (void)line:(NSString *)line;
 @end
 
 NS_ASSUME_NONNULL_END

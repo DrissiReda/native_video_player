@@ -92,11 +92,13 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         // with no reliance on any renderer being attached anywhere.
         var tb: CMTimebase?
         let st = CMTimebaseCreateWithSourceClock(
-            kCFAllocatorDefault, CMClockGetHostTimeClock(), &tb)
+            allocator: kCFAllocatorDefault,
+            sourceClock: CMClockGetHostTimeClock(),
+            timebaseOut: &tb)
         if st == noErr, let tb = tb {
             videoTimebase = tb
-            CMTimebaseSetTime(tb, .zero)
-            CMTimebaseSetRate(tb, 0)
+            CMTimebaseSetTime(tb, time: .zero)
+            CMTimebaseSetRate(tb, rate: 0)
             displayLayer.controlTimebase = tb
             GAV1FileLog.line("sw init timebase ok")
         } else {
@@ -137,10 +139,11 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         // Anchor "now" so the clock continues from wherever it is instead of
         // snapping back to a stale start time when the rate changes.
         let now = CMTimebaseGetTime(tb)
-        CMTimebaseSetRateAndAnchorTime(tb, Double(newRate),
-                                       atTime: now,
-                                       anchorTime: now,
-                                       atHostTime: CMClockGetTime(CMClockGetHostTimeClock()))
+        let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+        CMTimebaseSetRateAndAnchorTime(
+            tb, rate: Double(newRate),
+            anchorTime: now,
+            immediateSourceTime: hostNow)
         rate = newRate
 
         // Keep audio (if any) in step. Audio is best-effort: if it drifts a
@@ -155,7 +158,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         anchorTime = t
         if let tb = videoTimebase {
             CMTimebaseSetTime(tb, t)
-            CMTimebaseSetRate(tb, Double(rate))
+            CMTimebaseSetRate(tb, rate: Double(rate))
         }
         if let sync = audioSynchronizer {
             sync.setRate(rate, time: t)
@@ -378,7 +381,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                     DispatchQueue.main.async {
                         if let error = error {
                             self.rate = 0
-                            if let tb = self.videoTimebase { CMTimebaseSetRate(tb, 0) }
+                            if let tb = self.videoTimebase { CMTimebaseSetRate(tb, rate: 0) }
                             self.api.onError(error)
                         } else {
                             self.onStreamEnded()
@@ -423,7 +426,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         NotificationCenter.default.removeObserver(self)
         teardownEngine()
         rate = 0
-        if let tb = videoTimebase { CMTimebaseSetRate(tb, 0) }
+        if let tb = videoTimebase { CMTimebaseSetRate(tb, rate: 0) }
         if let sync = audioSynchronizer, let renderer = audioRenderer {
             sync.setRate(0, time: .zero)
             renderer.flush()
@@ -512,7 +515,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         GAV1FileLog.line("sw ended")
         atEOF = true
         rate = 0
-        if let tb = videoTimebase { CMTimebaseSetRate(tb, 0) }
+        if let tb = videoTimebase { CMTimebaseSetRate(tb, rate: 0) }
         if loop {
             seekTo(position: 0) { [weak self] in self?.startPump(rate: Float(self?.speed ?? 1)) }
         } else if !endedNotified {
@@ -527,7 +530,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             ?? NSError(domain: "AV1SoftwarePlayer", code: -10,
                        userInfo: [NSLocalizedDescriptionKey: "display layer decode failure"]) as Error
         rate = 0
-        if let tb = videoTimebase { CMTimebaseSetRate(tb, 0) }
+        if let tb = videoTimebase { CMTimebaseSetRate(tb, rate: 0) }
         api.onError(err)
     }
 }

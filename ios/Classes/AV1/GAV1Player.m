@@ -7,6 +7,7 @@
 // for network, NSFileHandle for local files).
 
 #import "GAV1Player.h"
+#import "GAV1FileLog.h"
 
 #import <libavformat/avformat.h>
 #import <libavcodec/avcodec.h>
@@ -145,7 +146,9 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
 - (void)dealloc { [self close]; }
 
 - (BOOL)open:(NSError **)error {
+    [GAV1FileLog log:@"open url=%@", _url.absoluteString];
     BOOL (^fail)(NSString *) = ^(NSString *msg) {
+        [GAV1FileLog log:@"open FAIL %@ url=%@", msg, _url.absoluteString];
         if (error) *error = [NSError errorWithDomain:@"GAV1Player" code:-1
                              userInfo:@{NSLocalizedDescriptionKey: msg}];
         return NO;
@@ -264,6 +267,9 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
     if (_vdec) NSLog(@"GAV1 opened: %dx%d fps=%.2f dur=%.2fs audio=%d vcodec=%d",
                      _vdec->width, _vdec->height, [self fps], [self durationSeconds],
                      _astream >= 0 ? 1 : 0, _vstream >= 0 ? _fmt->streams[_vstream]->codecpar->codec_id : -1);
+    if (_vdec) [GAV1FileLog log:@"opened %dx%d fps=%.2f dur=%.2fs audio=%d",
+                     _vdec->width, _vdec->height, [self fps], [self durationSeconds],
+                     _astream >= 0 ? 1 : 0];
     return _vdec ? _vdec->width : 0;
 }
 - (int)videoHeight { return _vdec ? _vdec->height : 0; }
@@ -287,6 +293,7 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
 - (void)requestStop { _stop = YES; }
 
 - (BOOL)seekToTime:(double)seconds {
+    [GAV1FileLog log:@"seek %.2f", seconds];
     if (!_fmt || _vstream < 0) return NO;
     AVRational tb = _fmt->streams[_vstream]->time_base;
     int64_t ts = (int64_t)(seconds / av_q2d(tb));
@@ -424,6 +431,8 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
     AVRational vtb = _fmt->streams[_vstream]->time_base;
     NSError *err = nil;
     BOOL eos = NO;
+    int nV = 0, nA = 0;
+    double firstPTS = -1, lastPTS = -1;
 
     while (!_stop && !eos) {
         int r = av_read_frame(_fmt, pkt);
@@ -435,7 +444,11 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
                     BOOL stop = NO;
                     CVPixelBufferRef px = [self pixelBufferFromFrame:frame];
                     if (px && videoHandler) {
-                        videoHandler(px, gav1_pts(frame, vtb), &stop);
+                        CMTime vpts = gav1_pts(frame, vtb);
+                        if (firstPTS < 0) firstPTS = CMTimeGetSeconds(vpts);
+                        lastPTS = CMTimeGetSeconds(vpts);
+                        nV++;
+                        videoHandler(px, vpts, &stop);
                         CFRelease(px);
                     }
                     av_frame_unref(frame);
@@ -447,6 +460,7 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
                         BOOL stop = NO;
                         CMSampleBufferRef sb = [self audioSampleFromFrame:frame];
                         if (sb && audioHandler) {
+                            nA++;
                             audioHandler(sb, &stop);
                             CFRelease(sb);
                         }
@@ -467,7 +481,11 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
                     BOOL stop = NO;
                     CVPixelBufferRef px = [self pixelBufferFromFrame:frame];
                     if (px && videoHandler) {
-                        videoHandler(px, gav1_pts(frame, vtb), &stop);
+                        CMTime vpts = gav1_pts(frame, vtb);
+                        if (firstPTS < 0) firstPTS = CMTimeGetSeconds(vpts);
+                        lastPTS = CMTimeGetSeconds(vpts);
+                        nV++;
+                        videoHandler(px, vpts, &stop);
                         CFRelease(px);
                     }
                     av_frame_unref(frame);
@@ -480,6 +498,7 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
                     BOOL stop = NO;
                     CMSampleBufferRef sb = [self audioSampleFromFrame:frame];
                     if (sb && audioHandler) {
+                        nA++;
                         audioHandler(sb, &stop);
                         CFRelease(sb);
                     }
@@ -493,10 +512,13 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
 
     av_packet_free(&pkt);
     av_frame_free(&frame);
+    [GAV1FileLog log:@"decode end video=%d audio=%d first=%.3f last=%.3f stopped=%d err=%@",
+        nV, nA, firstPTS, lastPTS, _stop ? 1 : 0, err ? err.localizedDescription : @"nil"];
     if (completion) completion(_stop ? nil : err);
 }
 
 - (void)close {
+    [GAV1FileLog log:@"close"];
     if (_sws) { sws_freeContext(_sws); _sws = NULL; }
     if (_swr) { swr_free(&_swr); _swr = NULL; }
     if (_vdec) { avcodec_free_context(&_vdec); _vdec = NULL; }

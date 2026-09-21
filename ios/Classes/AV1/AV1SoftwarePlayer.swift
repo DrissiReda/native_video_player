@@ -157,7 +157,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     private func setVideoClockTime(_ t: CMTime) {
         anchorTime = t
         if let tb = videoTimebase {
-            CMTimebaseSetTime(tb, t)
+            CMTimebaseSetTime(tb, time: t)
             CMTimebaseSetRate(tb, rate: Double(rate))
         }
         if let sync = audioSynchronizer {
@@ -430,7 +430,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         if let sync = audioSynchronizer, let renderer = audioRenderer {
             sync.setRate(0, time: .zero)
             renderer.flush()
-            sync.removeRenderer(renderer)
+            sync.removeRenderer(renderer, at: .zero)
         }
         audioSynchronizer = nil
         audioRenderer = nil

@@ -65,6 +65,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     private var endedNotified = false
 
     init(api: NativeVideoPlayerApi) {
+        GAV1FileLog.line("sw init enter")
         self.api = api
         super.init()
         // NOTE: the controller assigns api.delegate = self only after
@@ -79,6 +80,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             displayLayer.controlTimebase = synchronizer.timebase
         }
         synchronizer.addRenderer(displayLayer)
+        GAV1FileLog.line("sw init done")
         // Audio renderer is added lazily on first audio frame (sources
         // without audio must never add it: an idle audio renderer stalls
         // the synchronizer clock).

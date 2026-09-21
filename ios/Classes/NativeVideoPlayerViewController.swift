@@ -64,6 +64,7 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
 
 extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     func loadVideoSource(videoSource: VideoSource) {
+        GAV1FileLog.line(String(format: "ctl load type=%@ path=%@", videoSource.type.rawValue, videoSource.path))
         // ADDITIVE: on devices without an AV1 hardware decoder, try the
         // software backend first — it validates AV1 itself and fails fast
         // for anything else, in which case we run the original AVPlayer

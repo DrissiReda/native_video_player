@@ -2,14 +2,25 @@
 //
 // ADDITIVE file. Implements the same NativeVideoPlayerApiDelegate contract as
 // the AVPlayer-based controller, but decodes with dav1d (via GAV1Player) and
-// renders through AVSampleBufferDisplayLayer + AVSampleBufferRenderSynchronizer
-// (+ AVSampleBufferAudioRenderer when the source has audio).
+// renders through AVSampleBufferDisplayLayer. Audio, when present, goes
+// through AVSampleBufferAudioRenderer.
 //
 // It is engaged ONLY when BOTH hold:
 //   1. the source's video stream is AV1 (probed with GAV1Probe), and
 //   2. the device has no AV1 hardware decoder (AV1Capability).
 // Every other format keeps using the existing AVPlayer code path, byte for
 // byte unchanged.
+//
+// CLOCK DESIGN (this was the source of black frames / audio-only playback):
+// a render sink only presents enqueued sample buffers while the timebase that
+// drives it is RUNNING. AVSampleBufferRenderSynchronizer advances its clock
+// only while it hosts at least one renderer, and on iOS 15 AVSampleBufferDisplay
+// Layer cannot be added to it (addRenderer crashes). Therefore the display
+// layer is bound to a timebase that THIS CLASS owns and drives explicitly:
+// it runs on the host clock and we set start time / rate ourselves on
+// play/pause/seek. Audio is driven by a separate synchronizer that we keep in
+// step with the same values. Neither depends on the other to make progress,
+// so video-only and audio-only sources both work.
 
 import AVFoundation
 import CoreMedia
@@ -23,23 +34,26 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     // MARK: - render pipeline
 
     private let displayLayer = AVSampleBufferDisplayLayer()
-    private let synchronizer = AVSampleBufferRenderSynchronizer()
-    private let audioRenderer = AVSampleBufferAudioRenderer()
-    private var hasAudioRenderer = false
+
+    /// Audio renderer + the synchronizer that hosts it. Kept separate from the
+    /// display layer's clock because the display layer cannot join it on older
+    /// iOS. `nil` until the source is known to have audio.
+    private var audioRenderer: AVSampleBufferAudioRenderer?
+    private var audioSynchronizer: AVSampleBufferRenderSynchronizer?
+
+    /// The clock that drives `displayLayer`. Owned and driven by us.
+    private var videoTimebase: CMTimebase?
 
     // MARK: - decode engine
 
-    /// Media clock (the synchronizer's timebase), read for presentation
-    /// position. Retained strongly: the layer's controlTimebase is unowned.
-    private var videoClock: CMTimebase?
     private var engine: GAV1Player?
     private var sourceURL: URL?
     private var sourceHeaders: [String: String] = [:]
     private let pumpQueue = DispatchQueue(label: "av1.software.pump", qos: .userInitiated)
-    // All AVSampleBuffer* enqueue/addRenderer calls go through this serial
-    // queue. Using DispatchQueue.main.sync from the decode callbacks risked
-    // deadlocking with the main thread (play/seek/teardown), which the
-    // watchdog kills; a private queue removes that coupling entirely.
+    // All AVSampleBuffer* enqueue calls go through this serial queue. Using
+    // DispatchQueue.main.sync from the decode callbacks risked deadlocking
+    // with the main thread (play/seek/teardown), which the watchdog kills; a
+    // private queue removes that coupling entirely.
     private let enqueueQueue = DispatchQueue(label: "av1.software.enqueue", qos: .userInitiated)
     private var pumping = false
     private var atEOF = false
@@ -66,31 +80,36 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     private var volume: Float = 1
     private var info = VideoInfo(height: 0, width: 0, duration: 0)
     private var endedNotified = false
+    /// Clock time the current play/pause segment started from. Used to read
+    /// the presentation position without the synchronizer.
+    private var anchorTime: CMTime = .zero
 
     init(api: NativeVideoPlayerApi) {
         GAV1FileLog.line("sw init enter")
         self.api = api
+
+        // Own timebase on the host clock: always advances while rate != 0,
+        // with no reliance on any renderer being attached anywhere.
+        var tb: CMTimebase?
+        let st = CMTimebaseCreateWithSourceClock(
+            kCFAllocatorDefault, CMClockGetHostTimeClock(), &tb)
+        if st == noErr, let tb = tb {
+            videoTimebase = tb
+            CMTimebaseSetTime(tb, .zero)
+            CMTimebaseSetRate(tb, 0)
+            displayLayer.controlTimebase = tb
+            GAV1FileLog.line("sw init timebase ok")
+        } else {
+            // Without a clock nothing presents; report rather than show black.
+            GAV1FileLog.line(String(format: "sw init timebase FAILED st=%d", Int(st)))
+        }
+
         super.init()
+
         // NOTE: the controller assigns api.delegate = self only after
         // tryOpen succeeds, so a failed probe never hijacks callbacks.
         displayLayer.videoGravity = .resizeAspect
-        GAV1FileLog.line("sw init 1 gravity")
-        // Drive the display layer from the shared clock. Without an explicit
-        // timebase the layer accepts enqueued frames but never presents them
-        // (black), because nothing advances its clock.
-        // Video layer is NOT added to the synchronizer on iOS 15/16 (it
-        // crashes there). We drive displayLayer.controlTimebase manually
-        // instead. The synchronizer only ever hosts the audio renderer.
-        GAV1FileLog.line("sw init 2 pre-timebase")
-        displayLayer.controlTimebase = synchronizer.timebase
-        GAV1FileLog.line("sw init 3 post-timebase")
-        // Expose the media clock so presentation position can be read even
-        // when the layer is not hosted by the synchronizer.
-        videoClock = synchronizer.timebase
         GAV1FileLog.line("sw init done")
-        // Audio renderer is added lazily on first audio frame (sources
-        // without audio must never add it: an idle audio renderer stalls
-        // the synchronizer clock).
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(displayLayerFailed(_:)),
@@ -101,10 +120,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        // deinit can run on any thread; never block here. Just signal stop
-        // and free the engine (the pump may still be unwinding, so this
-        // branch is avoided in the normal controller flow by an explicit
-        // teardown before release).
         engine?.requestStop()
         engine?.close()
         engine = nil
@@ -112,6 +127,40 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     /// The layer the platform view must display instead of the AVPlayerLayer.
     var layer: CALayer { displayLayer }
+
+    // MARK: - clock control
+
+    /// Start/stop the video clock. `rate` is the synchronizer-style rate:
+    /// 1 = normal speed, 0 = paused, N = N× speed.
+    private func setVideoClockRate(_ newRate: Float) {
+        guard let tb = videoTimebase else { return }
+        // Anchor "now" so the clock continues from wherever it is instead of
+        // snapping back to a stale start time when the rate changes.
+        let now = CMTimebaseGetTime(tb)
+        CMTimebaseSetRateAndAnchorTime(tb, Double(newRate),
+                                       atTime: now,
+                                       anchorTime: now,
+                                       atHostTime: CMClockGetTime(CMClockGetHostTimeClock()))
+        rate = newRate
+
+        // Keep audio (if any) in step. Audio is best-effort: if it drifts a
+        // little the video clock is still the source of truth for position.
+        if let sync = audioSynchronizer {
+            sync.setRate(newRate, time: now)
+        }
+    }
+
+    /// Move the clock to an absolute media time (seek, replay, stop).
+    private func setVideoClockTime(_ t: CMTime) {
+        anchorTime = t
+        if let tb = videoTimebase {
+            CMTimebaseSetTime(tb, t)
+            CMTimebaseSetRate(tb, Double(rate))
+        }
+        if let sync = audioSynchronizer {
+            sync.setRate(rate, time: t)
+        }
+    }
 
     // MARK: - NativeVideoPlayerApiDelegate
 
@@ -121,8 +170,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     /// Must be called off the main thread (does network/demux I/O).
     func tryOpen(_ videoSource: VideoSource) -> Bool {
         GAV1FileLog.line(String(format: "sw tryOpen path=%@", videoSource.path))
-        // Never leak a previous engine (defensive; the controller currently
-        // creates a fresh instance per load).
         if engine != nil { teardownEngine() }
         let isURL = videoSource.type == .network
         guard let url = isURL ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else {
@@ -136,7 +183,9 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         } catch {
             return false
         }
-        GAV1FileLog.line(String(format: "sw tryOpen -> true %dx%d", Int(engine.videoWidth), Int(engine.videoHeight)))
+        GAV1FileLog.line(String(format: "sw tryOpen -> true %dx%d audio=%d",
+                                Int(engine.videoWidth), Int(engine.videoHeight),
+                                engine.hasAudio ? 1 : 0))
         sourceURL = url
         sourceHeaders = videoSource.headers
         self.engine = engine
@@ -145,12 +194,32 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                          duration: Int64(engine.durationSeconds * 1000))
         videoFPS = engine.fps > 0 ? engine.fps : 30
         videoFrameCount = 0
+        // Audio renderer only exists when the source has audio. A source
+        // without audio must NOT get one: it would stay idle and (on iOS 15)
+        // stall the synchronizer clock it is attached to.
+        if engine.hasAudio {
+            setupAudioRenderer()
+        }
         return true
+    }
+
+    /// Creates the audio renderer + its synchronizer. Called once per open,
+    /// only for sources that actually carry audio.
+    private func setupAudioRenderer() {
+        guard audioRenderer == nil else { return }
+        let sync = AVSampleBufferRenderSynchronizer()
+        let renderer = AVSampleBufferAudioRenderer()
+        renderer.volume = volume
+        if #available(iOS 16.0, *) {
+            renderer.audioTimePitchAlgorithm = .varispeed
+        }
+        sync.addRenderer(renderer)
+        audioSynchronizer = sync
+        audioRenderer = renderer
     }
 
     func loadVideoSource(videoSource: VideoSource) {
         // Normal entry point once tryOpen succeeded: reset state and announce.
-        // (If tryOpen was skipped, open here; on failure report the error.)
         if engine == nil {
             guard tryOpen(videoSource) else {
                 api.onError(NSError(domain: "AV1SoftwarePlayer", code: -2,
@@ -163,11 +232,12 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         lastEnqueuedPTS = .zero
         videoFrameCount = 0
         displayLayer.flush()
-        if hasAudioRenderer {
-            synchronizer.removeRenderer(audioRenderer, at: .zero)
-            hasAudioRenderer = false
+        if let sync = audioSynchronizer {
+            sync.setRate(0, time: .zero)
+            audioRenderer?.flush()
         }
-        audioRenderer.volume = volume
+        setVideoClockTime(.zero)
+        rate = 0
         api.onPlaybackReady()
     }
 
@@ -176,15 +246,16 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     func getPlaybackPosition() -> Int64 {
-        // Primary: the media clock (correct once audio drives it).
-        let t = synchronizer.currentTime()
-        if rate != 0 && t.isValid && !t.isIndefinite && t.seconds > 0 {
-            return Int64(t.seconds * 1000)
+        // Read the clock we own. It advances on the host clock while playing
+        // and holds still while paused/stopped, so it is always correct —
+        // unlike the previous synchronizer read, which stayed at 0 whenever
+        // no audio renderer was driving it.
+        if let tb = videoTimebase {
+            let t = CMTimebaseGetTime(tb)
+            if t.isValid && !t.isIndefinite && t.seconds >= 0 {
+                return Int64(t.seconds * 1000)
+            }
         }
-        // Fallback: last PTS we actually enqueued. The synchronizer clock
-        // stays at zero on iOS 15/16 because it only hosts the audio
-        // renderer; video-only clips would otherwise always report 0 and
-        // the app would keep its loading spinner up forever.
         let last = lastEnqueuedPTS
         guard last.isValid && !last.isIndefinite else { return 0 }
         return Int64(last.seconds * 1000)
@@ -195,7 +266,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         guard engine != nil else { return }
         endedNotified = false
         if atEOF {
-            // Replay from the start, like the AVPlayer controller does.
             seekTo(position: 0) { [weak self] in self?.startPump(rate: Float(self?.speed ?? 1)) }
             return
         }
@@ -204,17 +274,20 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     func pause() {
         GAV1FileLog.line("sw pause")
-        setSyncRate(0)
+        stopPump()
+        setVideoClockRate(0)
     }
 
     func stop(completion: @escaping () -> Void) {
         GAV1FileLog.line("sw stop")
-        setSyncRate(0)
         stopPump()
+        setVideoClockRate(0)
+        setVideoClockTime(.zero)
         if let engine = engine {
             _ = engine.seek(toTime: 0)
         }
         displayLayer.flush()
+        audioRenderer?.flush()
         atEOF = false
         completion()
     }
@@ -230,16 +303,15 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         let targetRate: Float = wasPlaying ? Float(speed) : 0
         stopPump()
         displayLayer.flush()
-        // Re-anchor the render clock to the seek target. Without this the
-        // synchronizer keeps the pre-seek time, so freshly decoded frames
-        // (whose PTS restart at the target) arrive "late" and are never
-        // presented (black) while the position readout goes stale.
-        synchronizer.setRate(0, time: CMTime(seconds: Double(position) / 1000.0,
-                                             preferredTimescale: 600))
+        audioRenderer?.flush()
+
+        let target = CMTime(seconds: Double(position) / 1000.0, preferredTimescale: 600)
+        // Park the clock at the target while we re-seek, then restart.
+        rate = 0
+        setVideoClockTime(target)
+
         atEOF = false
         endedNotified = false
-        // Restart the synthesis baseline from the seek target so invalid
-        // PTS after a seek still paces correctly.
         videoFrameCount = Int64((Double(position) / 1000.0) * max(videoFPS, 1))
         lastEnqueuedPTS = .zero
         pumpQueue.async { [weak self] in
@@ -247,7 +319,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             _ = engine.seek(toTime: Double(position) / 1000.0)
             DispatchQueue.main.async {
                 completion()
-                if wasPlaying || targetRate != 0 {
+                if targetRate != 0 {
                     self.startPump(rate: targetRate)
                 }
             }
@@ -256,19 +328,14 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     func setPlaybackSpeed(speed: Double) {
         self.speed = speed
-        // audioTimePitchAlgorithm needs iOS 16+; on 15.x the synchronizer
-        // rate still drives both renderers, just without pitch correction.
-        if #available(iOS 16.0, *) {
-            audioRenderer.audioTimePitchAlgorithm = .varispeed
-        }
         if rate != 0 {
-            setSyncRate(Float(speed))
+            setVideoClockRate(Float(speed))
         }
     }
 
     func setVolume(volume: Double) {
         self.volume = Float(volume)
-        audioRenderer.volume = self.volume
+        audioRenderer?.volume = self.volume
     }
 
     func setLoop(loop: Bool) {
@@ -277,25 +344,16 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     // MARK: - pump
 
-    /// Sets the synchronizer rate, falling back to time zero when the clock
-    /// has no valid current time yet (fresh synchronizer, no frames enqueued).
-    /// A setRate with an invalid time fails silently and leaves the clock
-    /// stopped — which presents as black frames.
-    private func setSyncRate(_ rate: Float) {
-        let t = synchronizer.currentTime()
-        synchronizer.setRate(rate, time: (t.isValid && !t.isIndefinite) ? t : .zero)
-        self.rate = rate
-    }
-
-    private func startPump(rate: Float) {
-        guard let engine = engine, !pumping else {
-            // Already pumping: just (re)set the clock rate.
-            if pumping { setSyncRate(rate) }
+    private func startPump(rate newRate: Float) {
+        guard let engine = engine else { return }
+        if pumping {
+            // Already decoding: only the clock needs to change.
+            setVideoClockRate(newRate)
             return
         }
         pumping = true
         stopLock.withLock { stopFlag = false; pumpActive = true }
-        setSyncRate(rate)
+        setVideoClockRate(newRate)
 
         pumpQueue.async { [weak self] in
             guard let self = self else { return }
@@ -320,6 +378,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                     DispatchQueue.main.async {
                         if let error = error {
                             self.rate = 0
+                            if let tb = self.videoTimebase { CMTimebaseSetRate(tb, 0) }
                             self.api.onError(error)
                         } else {
                             self.onStreamEnded()
@@ -335,7 +394,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         stopLock.withLock { stopFlag = true }
         // The decode call returns on the pump queue; pumping flips false in
         // its completion handler. Do not block the main thread waiting.
-        setSyncRate(0)
     }
 
     private func teardownEngine() {
@@ -344,8 +402,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         // the engine. Closing while the decode loop is mid-frame frees
         // _vdec/_fmt/_sws underneath it and crashes.
         stopPump()
-        // Bounded wait: the decode loop checks the stop flag between every
-        // packet/frame, so this returns promptly.
         let deadline = Date().addingTimeInterval(2.0)
         while stopLock.withLock({ pumpActive }) && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.005)
@@ -353,6 +409,31 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         engine?.close()
         engine = nil
         displayLayer.flush()
+    }
+
+    /// Full shutdown for view teardown: stops decode, silences and detaches
+    /// audio, and parks the clock. Called by the controller when the software
+    /// backend is dismissed — without this the audio renderer keeps playing
+    /// after the view is gone.
+    private var invalidated = false
+    func invalidate() {
+        guard !invalidated else { return }
+        invalidated = true
+        GAV1FileLog.line("sw invalidate")
+        NotificationCenter.default.removeObserver(self)
+        teardownEngine()
+        rate = 0
+        if let tb = videoTimebase { CMTimebaseSetRate(tb, 0) }
+        if let sync = audioSynchronizer, let renderer = audioRenderer {
+            sync.setRate(0, time: .zero)
+            renderer.flush()
+            sync.removeRenderer(renderer)
+        }
+        audioSynchronizer = nil
+        audioRenderer = nil
+        displayLayer.flush()
+        displayLayer.controlTimebase = nil
+        videoTimebase = nil
     }
 
     /// Read on the pump thread; set on the main thread by stopPump/teardown.
@@ -377,15 +458,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     private func enqueueVideo(pixelBuffer: CVPixelBuffer?, pts: CMTime, stop: inout Bool) {
         guard let pixelBuffer = pixelBuffer else { return }
-        // Diagnostic: first frames + layer/clock state (Console.app, filter GAV1).
-        if videoFrameCount < 5 {
-            let t = self.synchronizer.currentTime()
-            NSLog("GAV1 frame=%lld pts=%.3fs syncRate=%.2f syncTime=%.3fs layerReady=%d layerStatus=%ld clockValid=%d",
-                  videoFrameCount, pts.seconds, self.synchronizer.rate, t.seconds,
-                  self.displayLayer.isReadyForMoreMediaData ? 1 : 0,
-                  Int(self.displayLayer.status.rawValue),
-                  (t.isValid && !t.isIndefinite) ? 1 : 0)
-        }
+
         // Backpressure: wait until the layer wants more data. This keeps
         // memory bounded on long files and matches AVPlayer behaviour.
         while !displayLayer.isReadyForMoreMediaData && !stopRequested {
@@ -410,10 +483,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             sampleTiming: &timing,
             sampleBufferOut: &sample)
         guard st == noErr, let sample = sample else { return }
-        lastEnqueuedPTS = timing.presentationTimeStamp
 
-        // Serialize on our own queue (never the main thread: the pump can be
-        // started from main, so main.sync here deadlocks and gets killed).
         var failed = false
         enqueueQueue.sync {
             if self.displayLayer.status == .failed {
@@ -421,30 +491,20 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 return
             }
             self.displayLayer.enqueue(sample)
-            // Prime the clock on the first frame so playback starts even if
-            // the app never calls play() with an explicit rate yet.
-            if self.synchronizer.rate == 0 && self.rate != 0 {
-                self.setSyncRate(self.rate)
-            }
         }
         if failed {
             stop = true
         }
     }
+
     private func enqueueAudio(sampleBuffer: CMSampleBuffer?, stop: inout Bool) {
-        guard let sampleBuffer = sampleBuffer else { return }
-        if !hasAudioRenderer {
-            enqueueQueue.sync {
-                self.synchronizer.addRenderer(self.audioRenderer)
-                self.hasAudioRenderer = true
-            }
-        }
-        while !audioRenderer.isReadyForMoreMediaData && !stopRequested {
+        guard let sampleBuffer = sampleBuffer, let renderer = audioRenderer else { return }
+        while !renderer.isReadyForMoreMediaData && !stopRequested {
             Thread.sleep(forTimeInterval: 0.01)
         }
         if stopRequested { stop = true; return }
         enqueueQueue.sync {
-            self.audioRenderer.enqueue(sampleBuffer)
+            renderer.enqueue(sampleBuffer)
         }
     }
 
@@ -452,6 +512,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         GAV1FileLog.line("sw ended")
         atEOF = true
         rate = 0
+        if let tb = videoTimebase { CMTimebaseSetRate(tb, 0) }
         if loop {
             seekTo(position: 0) { [weak self] in self?.startPump(rate: Float(self?.speed ?? 1)) }
         } else if !endedNotified {
@@ -466,6 +527,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             ?? NSError(domain: "AV1SoftwarePlayer", code: -10,
                        userInfo: [NSLocalizedDescriptionKey: "display layer decode failure"]) as Error
         rate = 0
+        if let tb = videoTimebase { CMTimebaseSetRate(tb, 0) }
         api.onError(err)
     }
 }

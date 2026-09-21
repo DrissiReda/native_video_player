@@ -53,6 +53,10 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
         removeOnVideoCompletedObserver()
         removePeriodicTimeObserver()
 
+        // Tear down the software backend too: its decode thread and audio
+        // renderer are not reference-counted by the view.
+        swPlayer?.invalidate()
+        swPlayer = nil
         player.replaceCurrentItem(with: nil)
     }
     
@@ -110,9 +114,11 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
         timeControlObserver = nil
         lastPosition = -1
 
-        // Drop any previous SW backend (its layer and engine are released).
+        // Drop any previous SW backend (its layer, engine and audio renderer
+        // are released).
         if let old = swPlayer {
             old.layer.removeFromSuperlayer()
+            old.invalidate()
         }
         swPlayer = sw
         api.delegate = sw
@@ -131,6 +137,10 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     private func deactivateSoftwarePlayer() {
         if let sw = swPlayer {
             sw.layer.removeFromSuperlayer()
+            // Full shutdown: stop the decode pump and detach the audio
+            // renderer. Removing only the layer left audio playing after the
+            // view was dismissed.
+            sw.invalidate()
             swPlayer = nil
         }
         api.delegate = self

@@ -71,15 +71,19 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         // NOTE: the controller assigns api.delegate = self only after
         // tryOpen succeeds, so a failed probe never hijacks callbacks.
         displayLayer.videoGravity = .resizeAspect
+        GAV1FileLog.line("sw init 1 gravity")
         // Drive the display layer from the shared clock. Without an explicit
         // timebase the layer accepts enqueued frames but never presents them
         // (black), because nothing advances its clock.
         if #available(iOS 18.0, *) {
             // On iOS 18+ the renderer's own timebase is authoritative.
         } else {
+            GAV1FileLog.line("sw init 2 pre-timebase")
             displayLayer.controlTimebase = synchronizer.timebase
+            GAV1FileLog.line("sw init 3 post-timebase")
         }
         synchronizer.addRenderer(displayLayer)
+        GAV1FileLog.line("sw init 4 addRenderer")
         GAV1FileLog.line("sw init done")
         // Audio renderer is added lazily on first audio frame (sources
         // without audio must never add it: an idle audio renderer stalls

@@ -75,16 +75,12 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         // Drive the display layer from the shared clock. Without an explicit
         // timebase the layer accepts enqueued frames but never presents them
         // (black), because nothing advances its clock.
+        // Video layer is NOT added to the synchronizer on iOS 15/16 (it
+        // crashes there). We drive displayLayer.controlTimebase manually
+        // instead. The synchronizer only ever hosts the audio renderer.
         GAV1FileLog.line("sw init 2 pre-timebase")
-        if let tb = synchronizer.timebase as CMTimebase? {
-            displayLayer.controlTimebase = tb
-            GAV1FileLog.line("sw init 3 post-timebase")
-        } else {
-            GAV1FileLog.line("sw init 3 timebase nil")
-        }
-        GAV1FileLog.line("sw init 4 pre-addRenderer")
-        synchronizer.addRenderer(displayLayer)
-        GAV1FileLog.line("sw init 5 post-addRenderer")
+        displayLayer.controlTimebase = synchronizer.timebase
+        GAV1FileLog.line("sw init 3 post-timebase")
         GAV1FileLog.line("sw init done")
         // Audio renderer is added lazily on first audio frame (sources
         // without audio must never add it: an idle audio renderer stalls

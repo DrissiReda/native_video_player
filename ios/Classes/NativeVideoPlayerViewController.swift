@@ -116,6 +116,12 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
         }
         swPlayer = sw
         api.delegate = sw
+        // The platform view's final bounds may not be applied yet (Flutter
+        // sizes it after creation). Lay out first, then size the decode
+        // layer to the real bounds so the very first frame is not shown at
+        // the wrong aspect / size.
+        playerView.setNeedsLayout()
+        playerView.layoutIfNeeded()
         sw.layer.frame = playerView.bounds
         playerView.layer.addSublayer(sw.layer)
         sw.loadVideoSource(videoSource: videoSource)

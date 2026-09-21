@@ -29,6 +29,9 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     // MARK: - decode engine
 
+    /// Media clock (the synchronizer's timebase), read for presentation
+    /// position. Retained strongly: the layer's controlTimebase is unowned.
+    private var videoClock: CMTimebase?
     private var engine: GAV1Player?
     private var sourceURL: URL?
     private var sourceHeaders: [String: String] = [:]
@@ -81,6 +84,9 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         GAV1FileLog.line("sw init 2 pre-timebase")
         displayLayer.controlTimebase = synchronizer.timebase
         GAV1FileLog.line("sw init 3 post-timebase")
+        // Expose the media clock so presentation position can be read even
+        // when the layer is not hosted by the synchronizer.
+        videoClock = synchronizer.timebase
         GAV1FileLog.line("sw init done")
         // Audio renderer is added lazily on first audio frame (sources
         // without audio must never add it: an idle audio renderer stalls
@@ -170,9 +176,18 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     func getPlaybackPosition() -> Int64 {
+        // Primary: the media clock (correct once audio drives it).
         let t = synchronizer.currentTime()
-        guard t.isValid && !t.isIndefinite else { return 0 }
-        return Int64(t.seconds * 1000)
+        if rate != 0 && t.isValid && !t.isIndefinite && t.seconds > 0 {
+            return Int64(t.seconds * 1000)
+        }
+        // Fallback: last PTS we actually enqueued. The synchronizer clock
+        // stays at zero on iOS 15/16 because it only hosts the audio
+        // renderer; video-only clips would otherwise always report 0 and
+        // the app would keep its loading spinner up forever.
+        let last = lastEnqueuedPTS
+        guard last.isValid && !last.isIndefinite else { return 0 }
+        return Int64(last.seconds * 1000)
     }
 
     func play() {

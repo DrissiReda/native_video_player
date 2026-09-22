@@ -83,6 +83,13 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     /// Clock time the current play/pause segment started from. Used to read
     /// the presentation position without the synchronizer.
     private var anchorTime: CMTime = .zero
+    /// Rate the user asked for. The clock is only actually started once the
+    /// first frame after a load/seek has been enqueued: starting it earlier
+    /// lets host-clock time run past the first frame's PTS (which is ~0), so
+    /// the layer treats every early frame as late and drops them all —
+    /// black picture with a running clock, i.e. a spinner that never clears.
+    private var desiredRate: Float = 0
+    private var clockPrimed = false
 
     init(api: NativeVideoPlayerApi) {
         GAV1FileLog.line("sw init enter")
@@ -135,6 +142,16 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     /// Start/stop the video clock. `rate` is the synchronizer-style rate:
     /// 1 = normal speed, 0 = paused, N = N× speed.
     private func setVideoClockRate(_ newRate: Float) {
+        desiredRate = newRate
+        rate = newRate
+        // Until the first frame of this segment is on the layer there is
+        // nothing to present; running the clock now would race past it.
+        guard clockPrimed else { return }
+        applyClockRate(newRate)
+    }
+
+    /// Actually push a rate onto the timebases. Only call once primed.
+    private func applyClockRate(_ newRate: Float) {
         guard let tb = videoTimebase else { return }
         // Anchor "now" so the clock continues from wherever it is instead of
         // snapping back to a stale start time when the rate changes.
@@ -144,8 +161,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             tb, rate: Double(newRate),
             anchorTime: now,
             immediateSourceTime: hostNow)
-        rate = newRate
-
         // Keep audio (if any) in step. Audio is best-effort: if it drifts a
         // little the video clock is still the source of truth for position.
         if let sync = audioSynchronizer {
@@ -239,6 +254,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
             sync.setRate(0, time: .zero)
             audioRenderer?.flush()
         }
+        clockPrimed = false
         setVideoClockTime(.zero)
         rate = 0
         api.onPlaybackReady()
@@ -315,6 +331,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
         atEOF = false
         endedNotified = false
+        clockPrimed = false
         videoFrameCount = Int64((Double(position) / 1000.0) * max(videoFPS, 1))
         lastEnqueuedPTS = .zero
         pumpQueue.async { [weak self] in
@@ -494,6 +511,18 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 return
             }
             self.displayLayer.enqueue(sample)
+            // First frame of this segment is on the layer. Now it is safe to
+            // let the clock run: it will start from this frame's PTS instead
+            // of from a host time that already ran past it.
+            if !self.clockPrimed {
+                self.clockPrimed = true
+                if let tb = self.videoTimebase {
+                    CMTimebaseSetTime(tb, time: timing.presentationTimeStamp)
+                }
+                // Now that the segment is anchored, apply the rate the user
+                // asked for (recorded by setVideoClockRate while unprimed).
+                self.applyClockRate(self.desiredRate)
+            }
         }
         if failed {
             stop = true

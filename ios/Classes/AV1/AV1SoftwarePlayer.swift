@@ -193,7 +193,17 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         guard let url = isURL ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else {
             return false
         }
-        guard let engine = GAV1Player(url: url, headers: videoSource.headers) else {
+        // Merge the app's shared cookie jar into the request headers. The
+        // Flutter layer sends no Authorization header — auth travels in the
+        // cookie jar, exactly like the AVPlayer path — so without this every
+        // network open 401s ("cannot open input") while local files work.
+        var headers = videoSource.headers
+        if isURL, let storage = SwiftNativeVideoPlayerPlugin.cookieStorage {
+            let cookies = storage.cookies(for: url) ?? []
+            let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)
+            for (k, v) in cookieHeader { headers[k] = v }
+        }
+        guard let engine = GAV1Player(url: url, headers: headers) else {
             return false
         }
         do {

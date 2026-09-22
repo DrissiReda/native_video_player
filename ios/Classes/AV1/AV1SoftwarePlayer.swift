@@ -31,6 +31,14 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     private let api: NativeVideoPlayerApi
 
+    /// Resolves the cookie jar used to authenticate network opens. The plugin
+    /// installs a closure returning the host app's shared jar (the same one
+    /// the AVPlayer path uses). A closure, not a stored reference, so it stays
+    /// correct if the app assigns its jar after plugin registration. Kept off
+    /// the plugin class so this file has no compile-time dependency on it and
+    /// can be exercised standalone in the test harness.
+    static var cookieStorageProvider: (() -> HTTPCookieStorage?)?
+
     // MARK: - render pipeline
 
     private let displayLayer = AVSampleBufferDisplayLayer()
@@ -198,7 +206,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         // cookie jar, exactly like the AVPlayer path — so without this every
         // network open 401s ("cannot open input") while local files work.
         var headers = videoSource.headers
-        if isURL, let storage = SwiftNativeVideoPlayerPlugin.cookieStorage {
+        if isURL, let storage = AV1SoftwarePlayer.cookieStorageProvider?() {
             let cookies = storage.cookies(for: url) ?? []
             let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)
             for (k, v) in cookieHeader { headers[k] = v }

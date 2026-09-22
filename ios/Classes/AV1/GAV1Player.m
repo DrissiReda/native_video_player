@@ -175,7 +175,7 @@ static int64_t gav1p_seek(void *opaque, int64_t offset, int whence) {
         cfg.timeoutIntervalForResource = 60;
         // Same jar as the AVPlayer path so auth cookies are sent on every
         // request and refreshed responses are stored.
-        cfg.HTTPCookieStorage = [HTTPCookieStorage sharedHTTPCookieStorage];
+        cfg.HTTPCookieStorage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
         // Concurrent range reads: the demuxer seeks while the pump reads.
         cfg.HTTPMaximumConnectionsPerHost = 4;
         _io->session = [NSURLSession sessionWithConfiguration:cfg];

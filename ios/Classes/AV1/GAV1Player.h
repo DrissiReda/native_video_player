@@ -12,12 +12,10 @@ NS_ASSUME_NONNULL_BEGIN
                   audio:(void (^)(CMSampleBufferRef sampleBuffer, BOOL *stop))audioHandler
              completion:(void (^)(NSError * _Nullable error))completion;
 - (void)requestStop;
-- (void)close;
 
 @property (nonatomic, readonly) int videoWidth;
 @property (nonatomic, readonly) int videoHeight;
 @property (nonatomic, readonly) double durationSeconds;
-@property (nonatomic, readonly) double fps;
 @property (nonatomic, readonly) BOOL hasAudio;
 
 @end

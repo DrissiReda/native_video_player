@@ -8,7 +8,6 @@
 @implementation GAV1Player {
     NSURL *_url;
     NSDictionary *_headers;
-    NSURLSession *_session;
     int64_t _length;
     int64_t _position;
     AVFormatContext *_fmt;
@@ -19,7 +18,6 @@
     int _astream;
     struct SwsContext *_sws;
     SwrContext *_swr;
-    int _swrRate;
     CMAudioFormatDescriptionRef _adesc;
     volatile BOOL _stop;
 }
@@ -30,7 +28,7 @@ static NSData *gav1_get(GAV1Player *p, int64_t from, int64_t to) {
     for (NSString *k in p->_headers) [req setValue:p->_headers[k] forHTTPHeaderField:k];
     __block NSData *out = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [[p->_session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+    [[NSURLSession.sharedSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
         NSArray *range = [http.allHeaderFields[@"Content-Range"] componentsSeparatedByString:@"/"];
         if (range.count == 2) p->_length = [range[1] longLongValue];
@@ -58,10 +56,9 @@ static int64_t gav1_seek(void *opaque, int64_t offset, int whence) {
         if (p->_length < 0) gav1_get(p, 0, 0);
         return p->_length;
     }
-    int64_t pos = whence == SEEK_SET ? offset : whence == SEEK_CUR ? p->_position + offset : whence == SEEK_END ? p->_length + offset : -1;
-    if (pos < 0 || (p->_length >= 0 && pos > p->_length)) return -1;
-    p->_position = pos;
-    return pos;
+    if (whence != SEEK_SET) return -1;
+    p->_position = offset;
+    return offset;
 }
 
 static AVCodecContext *gav1_open_codec(AVFormatContext *fmt, int stream, const AVCodec *codec) {
@@ -85,16 +82,8 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
     return self;
 }
 
-- (void)dealloc {
-    [self close];
-}
-
 - (BOOL)open {
     if (!_url.isFileURL) {
-        NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.defaultSessionConfiguration;
-        cfg.timeoutIntervalForRequest = 15;
-        cfg.timeoutIntervalForResource = 60;
-        _session = [NSURLSession sessionWithConfiguration:cfg];
         _pb = avio_alloc_context(av_malloc(128 * 1024), 128 * 1024, 0, (__bridge void *)self, gav1_read, NULL, gav1_seek);
         _fmt = avformat_alloc_context();
         _fmt->pb = _pb;
@@ -108,56 +97,26 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
 
     _astream = av_find_best_stream(_fmt, AVMEDIA_TYPE_AUDIO, -1, _vstream, &acodec, 0);
     if (_astream >= 0 && (_adec = gav1_open_codec(_fmt, _astream, acodec))) {
-        _swrRate = _adec->sample_rate == 44100 ? 44100 : 48000;
         AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-        if (swr_alloc_set_opts2(&_swr, &stereo, AV_SAMPLE_FMT_S16, _swrRate, &_adec->ch_layout, _adec->sample_fmt, _adec->sample_rate, 0, NULL) < 0 || swr_init(_swr) < 0) {
+        if (swr_alloc_set_opts2(&_swr, &stereo, AV_SAMPLE_FMT_S16, _adec->sample_rate, &_adec->ch_layout, _adec->sample_fmt, _adec->sample_rate, 0, NULL) < 0 || swr_init(_swr) < 0) {
             swr_free(&_swr);
             avcodec_free_context(&_adec);
+            return YES;
         }
-        AudioStreamBasicDescription asbd = {
-            .mSampleRate = _swrRate,
-            .mFormatID = kAudioFormatLinearPCM,
-            .mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-            .mBytesPerPacket = 4,
-            .mFramesPerPacket = 1,
-            .mBytesPerFrame = 4,
-            .mChannelsPerFrame = 2,
-            .mBitsPerChannel = 16,
-        };
-        AudioChannelLayout layout = {.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo};
-        CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, sizeof(layout), &layout, 0, NULL, NULL, &_adesc);
+        AudioStreamBasicDescription asbd = {_adec->sample_rate, kAudioFormatLinearPCM, kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked, 4, 1, 4, 2, 16, 0};
+        CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &_adesc);
     }
     return YES;
 }
 
-- (int)videoWidth {
-    return _vdec->width;
-}
+- (int)videoWidth { return _vdec->width; }
+- (int)videoHeight { return _vdec->height; }
 
-- (int)videoHeight {
-    return _vdec->height;
-}
-
-- (double)durationSeconds {
-    AVStream *s = _fmt->streams[_vstream];
-    if (s->duration != AV_NOPTS_VALUE) return s->duration * av_q2d(s->time_base);
-    return _fmt->duration != AV_NOPTS_VALUE ? _fmt->duration / (double)AV_TIME_BASE : 0;
-}
-
-- (double)fps {
-    return av_q2d(av_guess_frame_rate(_fmt, _fmt->streams[_vstream], NULL));
-}
-
-- (BOOL)hasAudio {
-    return _adec != NULL;
-}
-
-- (void)requestStop {
-    _stop = YES;
-}
+- (double)durationSeconds { return _fmt->duration != AV_NOPTS_VALUE ? _fmt->duration / (double)AV_TIME_BASE : 0; }
+- (BOOL)hasAudio { return _adec != NULL; }
+- (void)requestStop { _stop = YES; }
 
 - (void)seekToTime:(double)seconds {
-    if (!_fmt) return;
     int64_t ts = seconds / av_q2d(_fmt->streams[_vstream]->time_base);
     if (avformat_seek_file(_fmt, _vstream, INT64_MIN, ts, ts, AVSEEK_FLAG_BACKWARD) < 0) return;
     avcodec_flush_buffers(_vdec);
@@ -187,7 +146,7 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
         return NULL;
     }
     CMTime pts = gav1_pts(frame, _fmt->streams[_astream]->time_base);
-    CMSampleTimingInfo timing = {CMTimeMake(got, _swrRate), CMTIME_IS_VALID(pts) ? pts : kCMTimeZero, kCMTimeInvalid};
+    CMSampleTimingInfo timing = {CMTimeMake(got, _adec->sample_rate), CMTIME_IS_VALID(pts) ? pts : kCMTimeZero, kCMTimeInvalid};
     CMSampleBufferRef sb = NULL;
     CMSampleBufferCreateReady(kCFAllocatorDefault, block, _adesc, got, 1, &timing, 0, NULL, &sb);
     CFRelease(block);
@@ -241,18 +200,15 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
     completion(_stop ? nil : err);
 }
 
-- (void)close {
+- (void)dealloc {
     sws_freeContext(_sws);
-    _sws = NULL;
     swr_free(&_swr);
     avcodec_free_context(&_vdec);
     avcodec_free_context(&_adec);
     avformat_close_input(&_fmt);
     if (_pb) av_freep(&_pb->buffer);
     avio_context_free(&_pb);
-    [_session invalidateAndCancel];
     if (_adesc) CFRelease(_adesc);
-    _adesc = NULL;
 }
 
 @end

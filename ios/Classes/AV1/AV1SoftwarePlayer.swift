@@ -1,6 +1,6 @@
 import AVFoundation
 
-final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
+final class AV1SoftwarePlayer: NativeVideoPlayerApiDelegate {
     private let api: NativeVideoPlayerApi
     private let displayLayer = AVSampleBufferDisplayLayer()
     private let videoTimebase: CMTimebase
@@ -9,21 +9,16 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     private var engine: GAV1Player?
     private let pumpQueue = DispatchQueue(label: "av1.software.pump", qos: .userInitiated)
     private var atEOF = false
-    private var videoFrameCount: Int64 = 0
-    private var videoFPS: Double = 30
     private var stopFlag = false
     private var pumpActive = false
     private let stopLock = NSLock()
     private var loop = false
     private var rate: Float = 0
-    private var desiredRate: Float = 0
     private var speed: Double = 1
     private var clockPrimed = false
     private var seekFloor = CMTime.zero
-    private var endedNotified = false
     private var info = VideoInfo(height: 0, width: 0, duration: 0)
     private var positionTimer: Timer?
-    private var lastPosition: Int64 = -1
 
     var layer: CALayer { displayLayer }
 
@@ -32,10 +27,8 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         var tb: CMTimebase?
         CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &tb)
         videoTimebase = tb!
-        super.init()
         displayLayer.controlTimebase = videoTimebase
         displayLayer.videoGravity = .resizeAspect
-        NotificationCenter.default.addObserver(self, selector: #selector(displayLayerFailed(_:)), name: .AVSampleBufferDisplayLayerFailedToDecode, object: displayLayer)
     }
 
     func tryOpen(_ videoSource: VideoSource) -> Bool {
@@ -47,12 +40,8 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         guard engine.open() else { return false }
         self.engine = engine
         info = VideoInfo(height: Int(engine.videoHeight), width: Int(engine.videoWidth), duration: Int64(engine.durationSeconds * 1000))
-        if engine.fps > 0 { videoFPS = engine.fps }
         if engine.hasAudio {
             let renderer = AVSampleBufferAudioRenderer()
-            if #available(iOS 16.0, *) {
-                renderer.audioTimePitchAlgorithm = .varispeed
-            }
             let sync = AVSampleBufferRenderSynchronizer()
             sync.addRenderer(renderer)
             audioRenderer = renderer
@@ -63,33 +52,16 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     func invalidate() {
         positionTimer?.invalidate()
-        NotificationCenter.default.removeObserver(self)
         stopPump()
-        let deadline = Date().addingTimeInterval(2)
-        while stopLock.withLock({ pumpActive }) && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.005)
-        }
-        engine?.close()
-        engine = nil
-        if let sync = audioSynchronizer, let renderer = audioRenderer {
-            sync.setRate(0, time: .zero)
-            renderer.flush()
-            sync.removeRenderer(renderer, at: .zero)
-        }
+        audioSynchronizer?.setRate(0, time: .zero)
     }
 
     func loadVideoSource(videoSource: VideoSource) {
         api.onPlaybackReady()
-        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+        positionTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            let position = self.getPlaybackPosition()
-            if position != self.lastPosition {
-                self.lastPosition = position
-                self.api.onPlaybackPositionChanged(position: position)
-            }
+            self.api.onPlaybackPositionChanged(position: self.getPlaybackPosition())
         }
-        RunLoop.main.add(timer, forMode: .common)
-        positionTimer = timer
     }
 
     func getVideoInfo(completion: @escaping (VideoInfo) -> Void) {
@@ -97,18 +69,13 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     func getPlaybackPosition() -> Int64 {
-        let t = CMTimebaseGetTime(videoTimebase)
-        return t.isNumeric && t.seconds >= 0 ? Int64(t.seconds * 1000) : 0
+        Int64(max(CMTimebaseGetTime(videoTimebase).seconds, 0) * 1000)
     }
 
     func play() {
-        guard engine != nil else { return }
-        endedNotified = false
-        if atEOF {
-            seekTo(position: 0) { [weak self] in self?.startPump(rate: Float(self?.speed ?? 1)) }
-            return
-        }
-        startPump(rate: Float(speed))
+        guard atEOF else { return startPump(rate: Float(speed)) }
+        rate = Float(speed)
+        seekTo(position: 0) {}
     }
 
     func pause() {
@@ -131,7 +98,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         stopPump()
         setClockTime(target)
         atEOF = false
-        endedNotified = false
         pumpQueue.async { [weak self] in
             engine.seek(toTime: seconds)
             DispatchQueue.main.async {
@@ -141,7 +107,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 self.setClockTime(target)
                 self.clockPrimed = false
                 self.seekFloor = target
-                self.videoFrameCount = Int64(seconds * self.videoFPS)
                 self.startPump(rate: self.rate)
                 completion()
             }
@@ -162,7 +127,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     private func setClockRate(_ newRate: Float) {
-        desiredRate = newRate
         rate = newRate
         if clockPrimed { applyClockRate(newRate) }
     }
@@ -200,8 +164,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 if stopped { return }
                 DispatchQueue.main.async {
                     guard let error = error else { return self.onStreamEnded() }
-                    self.rate = 0
-                    CMTimebaseSetRate(self.videoTimebase, rate: 0)
+                    self.setClockRate(0)
                     self.api.onError(error)
                 }
             })
@@ -218,9 +181,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     private func enqueueVideo(_ pixelBuffer: CVPixelBuffer, pts: CMTime, stop: UnsafeMutablePointer<ObjCBool>) {
-        let presentationTime = pts.isNumeric ? pts : CMTime(seconds: Double(videoFrameCount) / videoFPS, preferredTimescale: 600)
-        videoFrameCount += 1
-        if presentationTime < seekFloor { return }
+        if pts < seekFloor { return }
         while !displayLayer.isReadyForMoreMediaData && !stopRequested {
             Thread.sleep(forTimeInterval: 0.01)
         }
@@ -229,7 +190,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         var format: CMVideoFormatDescription?
         CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &format)
         guard let format = format else { return }
-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: presentationTime, decodeTimeStamp: .invalid)
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
         CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample)
         guard let sample = sample else { return }
@@ -238,8 +199,8 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         displayLayer.enqueue(sample)
         if !clockPrimed {
             clockPrimed = true
-            CMTimebaseSetTime(videoTimebase, time: presentationTime)
-            applyClockRate(desiredRate)
+            CMTimebaseSetTime(videoTimebase, time: pts)
+            applyClockRate(rate)
         }
     }
 
@@ -253,20 +214,9 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     private func onStreamEnded() {
+        if loop { return seekTo(position: 0) {} }
         atEOF = true
-        rate = 0
-        CMTimebaseSetRate(videoTimebase, rate: 0)
-        if loop {
-            seekTo(position: 0) { [weak self] in self?.startPump(rate: Float(self?.speed ?? 1)) }
-        } else if !endedNotified {
-            endedNotified = true
-            api.onPlaybackEnded()
-        }
-    }
-
-    @objc private func displayLayerFailed(_ note: Notification) {
-        rate = 0
-        CMTimebaseSetRate(videoTimebase, rate: 0)
-        api.onError(note.userInfo?[AVSampleBufferDisplayLayerFailedToDecodeNotificationErrorKey] as? Error ?? NSError(domain: "AV1SoftwarePlayer", code: -10))
+        setClockRate(0)
+        api.onPlaybackEnded()
     }
 }

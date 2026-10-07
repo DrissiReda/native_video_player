@@ -30,6 +30,4 @@ A Flutter widget to play videos on iOS and Android using a native implementation
     unzip -oq deps.zip 'XCFrameworks/*' && rm deps.zip
   CMD
   s.vendored_frameworks = 'XCFrameworks/*.xcframework'
-  s.libraries = 'z', 'bz2', 'iconv', 'c++'
-  s.frameworks = 'AudioToolbox', 'CoreMedia', 'CoreVideo', 'VideoToolbox'
 end

@@ -67,10 +67,6 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
             let opened = sw.tryOpen(videoSource)
             DispatchQueue.main.async {
                 self.probing = false
-                self.swPlayer?.layer.removeFromSuperlayer()
-                self.swPlayer?.invalidate()
-                self.swPlayer = nil
-                self.api.delegate = self
                 if opened {
                     self.removeOnVideoCompletedObserver()
                     self.removePeriodicTimeObserver()

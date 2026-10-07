@@ -29,5 +29,11 @@ class NativeVideoPlayerView: UIView {
         super.layoutSubviews()
         playerLayer.frame = bounds
         playerLayer.removeAllAnimations()
+        // ADDITIVE: keep any software-decode layer (AVSampleBufferDisplayLayer
+        // added by the AV1 backend) sized to the view as well.
+        for sub in layer.sublayers ?? [] where sub is AVSampleBufferDisplayLayer {
+            sub.frame = bounds
+            sub.removeAllAnimations()
+        }
     }
 }

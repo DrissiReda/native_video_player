@@ -1,0 +1,2 @@
+ios/patches/*.patch whitespace=-blank-at-eol
+ios/XCFrameworks/**/*.h whitespace=-blank-at-eof

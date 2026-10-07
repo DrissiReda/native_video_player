@@ -1,0 +1,5 @@
+framework module Libdav1d {
+  umbrella header "dav1d/dav1d.h"
+  export *
+  link "Libdav1d"
+}

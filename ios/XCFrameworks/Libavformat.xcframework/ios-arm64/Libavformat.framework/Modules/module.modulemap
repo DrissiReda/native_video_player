@@ -1,0 +1,5 @@
+framework module Libavformat {
+  umbrella header "libavformat/avformat.h"
+  export *
+  link "Libavformat"
+}

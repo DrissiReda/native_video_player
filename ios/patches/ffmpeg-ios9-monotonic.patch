@@ -1,0 +1,71 @@
+--- a/libavutil/time.c
++++ b/libavutil/time.c
+@@ -32,6 +32,9 @@
+ #if HAVE_WINDOWS_H
+ #include <windows.h>
+ #endif
++#if defined(__APPLE__)
++#include <mach/mach_time.h>
++#endif
+ 
+ #include "time.h"
+ #include "error.h"
+@@ -53,28 +56,43 @@
+ #endif
+ }
+ 
+-int64_t av_gettime_relative(void)
++#if defined(__APPLE__)
++/*
++ * Monotonic microseconds for Darwin, taken from mach_absolute_time() scaled
++ * by the mach timebase. clock_gettime(CLOCK_MONOTONIC) only exists from
++ * iOS 10.0 / macOS 10.12 on, so using it would leave an undefined (weakly
++ * imported) symbol behind while the plugin keeps an iOS 9.0 deployment
++ * floor; mach_absolute_time() is available and monotonic on every version.
++ */
++static int64_t av_gettime_relative_mach(void)
+ {
+-#if HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
+-#ifdef __APPLE__
+-    if (&clock_gettime)
+-#endif
+-    {
+-        struct timespec ts;
+-        clock_gettime(CLOCK_MONOTONIC, &ts);
+-        return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+-    }
++    mach_timebase_info_data_t timebase;
++    uint64_t ticks = mach_absolute_time();
++
++    mach_timebase_info(&timebase);
++    /* 128-bit intermediate keeps ticks * numer overflow-free. */
++    return (int64_t)(((__uint128_t)ticks * timebase.numer / timebase.denom) / 1000);
++}
+ #endif
++
++int64_t av_gettime_relative(void)
++{
++#if defined(__APPLE__)
++    return av_gettime_relative_mach();
++#elif HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
++#else
+     return av_gettime() + 42 * 60 * 60 * INT64_C(1000000);
++#endif
+ }
+ 
+ int av_gettime_relative_is_monotonic(void)
+ {
+-#if HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
+-#ifdef __APPLE__
+-    if (!&clock_gettime)
+-        return 0;
+-#endif
++#if defined(__APPLE__)
++    return 1;
++#elif HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
+     return 1;
+ #else
+     return 0;

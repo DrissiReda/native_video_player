@@ -1,0 +1,5 @@
+framework module Libswscale {
+  umbrella header "libswscale/swscale.h"
+  export *
+  link "Libswscale"
+}

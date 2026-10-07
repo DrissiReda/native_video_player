@@ -242,7 +242,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     private func enqueueAudio(_ sampleBuffer: CMSampleBuffer, stop: UnsafeMutablePointer<ObjCBool>) {
         guard let renderer = audioRenderer else { return }
-        while !renderer.isReadyForMoreMediaData && !stopRequested {
+        while !renderer.isReadyForMoreMediaData && clockPrimed && !stopRequested {
             Thread.sleep(forTimeInterval: 0.01)
         }
         if stopRequested { stop.pointee = true; return }

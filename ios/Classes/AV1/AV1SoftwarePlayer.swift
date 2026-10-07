@@ -111,19 +111,12 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     func pause() {
-        stopPump()
         setClockRate(0)
     }
 
     func stop(completion: @escaping () -> Void) {
-        stopPump()
-        setClockRate(0)
-        setClockTime(.zero)
-        engine?.seek(toTime: 0)
-        displayLayer.flush()
-        audioRenderer?.flush()
-        atEOF = false
-        completion()
+        pause()
+        seekTo(position: 0, completion: completion)
     }
 
     func isPlaying() -> Bool {
@@ -135,19 +128,20 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         let targetRate: Float = rate != 0 ? Float(speed) : 0
         let seconds = Double(position) / 1000
         stopPump()
-        displayLayer.flush()
-        audioRenderer?.flush()
         rate = 0
         setClockTime(CMTime(seconds: seconds, preferredTimescale: 600))
         atEOF = false
         endedNotified = false
-        clockPrimed = false
-        videoFrameCount = Int64(seconds * videoFPS)
         pumpQueue.async { [weak self] in
             engine.seek(toTime: seconds)
             DispatchQueue.main.async {
+                guard let self = self else { return completion() }
+                self.displayLayer.flush()
+                self.audioRenderer?.flush()
+                self.clockPrimed = false
+                self.videoFrameCount = Int64(seconds * self.videoFPS)
                 completion()
-                if targetRate != 0 { self?.startPump(rate: targetRate) }
+                if targetRate != 0 { self.startPump(rate: targetRate) }
             }
         }
     }
@@ -197,7 +191,11 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 self.enqueueAudio(sampleBuffer, stop: stop)
             }, completion: { [weak self] error in
                 guard let self = self else { return }
-                self.stopLock.withLock { self.pumpActive = false }
+                let stopped = self.stopLock.withLock { () -> Bool in
+                    self.pumpActive = false
+                    return self.stopFlag
+                }
+                if stopped { return }
                 DispatchQueue.main.async {
                     guard let error = error else { return self.onStreamEnded() }
                     self.rate = 0

@@ -125,11 +125,10 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
 
     func seekTo(position: Int64, completion: @escaping () -> Void) {
         guard let engine = engine else { return completion() }
-        let targetRate: Float = rate != 0 ? Float(speed) : 0
         let seconds = Double(position) / 1000
+        let target = CMTime(seconds: seconds, preferredTimescale: 600)
         stopPump()
-        rate = 0
-        setClockTime(CMTime(seconds: seconds, preferredTimescale: 600))
+        setClockTime(target)
         atEOF = false
         endedNotified = false
         pumpQueue.async { [weak self] in
@@ -138,10 +137,11 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 guard let self = self else { return completion() }
                 self.displayLayer.flush()
                 self.audioRenderer?.flush()
+                self.setClockTime(target)
                 self.clockPrimed = false
                 self.videoFrameCount = Int64(seconds * self.videoFPS)
+                self.startPump(rate: self.rate)
                 completion()
-                if targetRate != 0 { self.startPump(rate: targetRate) }
             }
         }
     }

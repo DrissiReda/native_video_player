@@ -1,7 +1,7 @@
 import AVFoundation
 import Flutter
 import Foundation
-import UIKit
+import VideoToolbox
 
 public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
     private let api: NativeVideoPlayerApi
@@ -9,20 +9,11 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
     private let playerView: NativeVideoPlayerView
     private var loop = false
     private var lastPosition: Int64 = -1
-    private var swPositionTimer: Timer?
     private var timeObserver: Any?
     private var timeControlObserver: NSKeyValueObservation?
-
-    // ADDITIVE (AV1 software path): when non-nil, this backend owns playback
-    // and every delegate method below forwards to it. When nil, the original
-    // AVPlayer code path runs byte-for-byte as before. The backend is engaged
-    // only for AV1 sources on devices without an AV1 hardware decoder.
-    private var swPlayer: AnyObject?
-    private let probeQueue = DispatchQueue(label: "av1.probe", qos: .userInitiated)
-    // If play() arrives while the codec probe is still running, remember it
-    // and start playback as soon as the backend is ready.
+    private var swPlayer: AV1SoftwarePlayer?
+    private var probing = false
     private var pendingPlay = false
-    private var probeInFlight = false
 
     init(
         messenger: FlutterBinaryMessenger,
@@ -42,13 +33,8 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
         
         // Play audio even when the device is in silent mode
         do {
-            let session = AVAudioSession.sharedInstance()
-            if #available(iOS 10.0, *) {
-                try session.setCategory(.playback, mode: .default)
-            } else {
-                try session.setCategory(.playback)
-            }
-            try session.setActive(true)
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             print("Failed to set playback audio session. Error: \(error)")
         }
@@ -56,17 +42,11 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
     
     deinit {
         player.removeObserver(self, forKeyPath: "status")
-        stopSoftwarePositionTimer()
         timeControlObserver?.invalidate()
         removeOnVideoCompletedObserver()
         removePeriodicTimeObserver()
+        swPlayer?.invalidate()
 
-        // Tear down the software backend too: its decode thread and audio
-        // renderer are not reference-counted by the view.
-        if #available(iOS 11.0, *) {
-            (swPlayer as? AV1SoftwarePlayer)?.invalidate()
-        }
-        swPlayer = nil
         player.replaceCurrentItem(with: nil)
     }
     
@@ -78,107 +58,41 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
 
 extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     func loadVideoSource(videoSource: VideoSource) {
-        // ADDITIVE: on devices without an AV1 hardware decoder, try the
-        // software backend first — it validates AV1 itself and fails fast
-        // for anything else, in which case we run the original AVPlayer
-        // code below, untouched. Devices WITH hardware AV1 skip this
-        // entirely: zero behavior change.
-        guard #available(iOS 11.0, *), !AV1Capability.hasHardwareDecoder else {
-            loadVideoSourceNative(videoSource)
-            return
-        }
-        probeInFlight = true
+        guard !VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) else { return loadNativeVideoSource(videoSource) }
+        probing = true
         pendingPlay = false
-        probeQueue.async { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let sw = AV1SoftwarePlayer(api: self.api)
             let opened = sw.tryOpen(videoSource)
             DispatchQueue.main.async {
-                self.probeInFlight = false
+                self.probing = false
+                self.swPlayer?.layer.removeFromSuperlayer()
+                self.swPlayer?.invalidate()
+                self.swPlayer = nil
+                self.api.delegate = self
                 if opened {
-                    self.activateSoftware(sw, videoSource: videoSource)
-                    if self.pendingPlay {
-                        self.pendingPlay = false
-                        sw.play()
-                    }
+                    self.removeOnVideoCompletedObserver()
+                    self.removePeriodicTimeObserver()
+                    self.timeControlObserver?.invalidate()
+                    self.player.replaceCurrentItem(with: nil)
+                    self.swPlayer = sw
+                    self.api.delegate = sw
+                    self.playerView.layer.addSublayer(sw.layer)
+                    self.playerView.setNeedsLayout()
+                    sw.loadVideoSource(videoSource: videoSource)
                 } else {
-                    self.deactivateSoftwarePlayer()
-                    self.loadVideoSourceNative(videoSource)
-                    if self.pendingPlay {
-                        self.pendingPlay = false
-                        self.play()
-                    }
+                    self.loadNativeVideoSource(videoSource)
+                }
+                if self.pendingPlay {
+                    self.pendingPlay = false
+                    self.api.delegate?.play()
                 }
             }
         }
     }
 
-    // ADDITIVE: engage an already-opened software backend.
-    @available(iOS 11.0, *)
-    private func activateSoftware(_ sw: AV1SoftwarePlayer, videoSource: VideoSource) {
-        // Park the AVPlayer so it holds no item and emits no callbacks.
-        removeOnVideoCompletedObserver()
-        player.replaceCurrentItem(with: nil)
-        removePeriodicTimeObserver()
-        timeControlObserver?.invalidate()
-        timeControlObserver = nil
-
-        // Drop any previous SW backend (its layer, engine and audio renderer
-        // are released).
-        if let old = swPlayer as? AV1SoftwarePlayer {
-            old.layer.removeFromSuperlayer()
-            old.invalidate()
-        }
-        swPlayer = sw
-        api.delegate = sw
-        // The platform view's final bounds may not be applied yet (Flutter
-        // sizes it after creation). Lay out first, then size the decode
-        // layer to the real bounds so the very first frame is not shown at
-        // the wrong aspect / size.
-        playerView.setNeedsLayout()
-        playerView.layoutIfNeeded()
-        sw.layer.frame = playerView.bounds
-        playerView.layer.addSublayer(sw.layer)
-        startSoftwarePositionTimer(sw)
-        sw.loadVideoSource(videoSource: videoSource)
-    }
-
-    @available(iOS 11.0, *)
-    private func startSoftwarePositionTimer(_ sw: AV1SoftwarePlayer) {
-        swPositionTimer?.invalidate()
-        lastPosition = -1
-        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            let position = sw.getPlaybackPosition()
-            guard position != self.lastPosition else { return }
-            self.lastPosition = position
-            self.api.onPlaybackPositionChanged(position: position)
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        swPositionTimer = timer
-    }
-
-    private func stopSoftwarePositionTimer() {
-        swPositionTimer?.invalidate()
-        swPositionTimer = nil
-    }
-
-    // ADDITIVE: return to the native backend (restores api.delegate).
-    @available(iOS 11.0, *)
-    private func deactivateSoftwarePlayer() {
-        stopSoftwarePositionTimer()
-        if let sw = swPlayer as? AV1SoftwarePlayer {
-            sw.layer.removeFromSuperlayer()
-            // Full shutdown: stop the decode pump and detach the audio
-            // renderer. Removing only the layer left audio playing after the
-            // view was dismissed.
-            sw.invalidate()
-            swPlayer = nil
-        }
-        api.delegate = self
-    }
-
-    private func loadVideoSourceNative(_ videoSource: VideoSource) {
+    private func loadNativeVideoSource(_ videoSource: VideoSource) {
         let isUrl = videoSource.type == .network
         let sourcePath = videoSource.path
         guard let uri = isUrl ? URL(string: sourcePath) : URL(fileURLWithPath: sourcePath) else { return }
@@ -198,9 +112,7 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
         removeOnVideoCompletedObserver()
         player.replaceCurrentItem(with: playerItem)
         addOnVideoCompletedObserver()
-        if #available(iOS 10.0, *) {
-            timeControlObserver = addTimeControlObserver(currentItem: playerItem)
-        }
+        timeControlObserver = addTimeControlObserver(currentItem: playerItem)
         api.onPlaybackReady()
         addPeriodicTimeObserver()
     }
@@ -269,12 +181,7 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     }
     
     func play() {
-        // ADDITIVE: a play() landing while the codec probe is still running
-        // would hit the idle AVPlayer and get lost. Remember it instead.
-        if probeInFlight {
-            pendingPlay = true
-            return
-        }
+        if probing { pendingPlay = true; return }
         if player.currentItem?.currentTime() == player.currentItem?.duration {
             player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
         }
@@ -369,7 +276,6 @@ extension NativeVideoPlayerViewController {
         )
     }
 
-    @available(iOS 10.0, *)
     private func addTimeControlObserver(currentItem: AVPlayerItem) -> NSKeyValueObservation {
         return currentItem.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] item, _ in
             if item.isPlaybackLikelyToKeepUp,

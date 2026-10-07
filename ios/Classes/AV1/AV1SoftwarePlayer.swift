@@ -19,6 +19,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     private var desiredRate: Float = 0
     private var speed: Double = 1
     private var clockPrimed = false
+    private var seekFloor = CMTime.zero
     private var endedNotified = false
     private var info = VideoInfo(height: 0, width: 0, duration: 0)
     private var positionTimer: Timer?
@@ -139,6 +140,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
                 self.audioRenderer?.flush()
                 self.setClockTime(target)
                 self.clockPrimed = false
+                self.seekFloor = target
                 self.videoFrameCount = Int64(seconds * self.videoFPS)
                 self.startPump(rate: self.rate)
                 completion()
@@ -216,6 +218,9 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     private func enqueueVideo(_ pixelBuffer: CVPixelBuffer, pts: CMTime, stop: UnsafeMutablePointer<ObjCBool>) {
+        let presentationTime = pts.isNumeric ? pts : CMTime(seconds: Double(videoFrameCount) / videoFPS, preferredTimescale: 600)
+        videoFrameCount += 1
+        if presentationTime < seekFloor { return }
         while !displayLayer.isReadyForMoreMediaData && !stopRequested {
             Thread.sleep(forTimeInterval: 0.01)
         }
@@ -224,8 +229,6 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
         var format: CMVideoFormatDescription?
         CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &format)
         guard let format = format else { return }
-        let presentationTime = pts.isNumeric ? pts : CMTime(seconds: Double(videoFrameCount) / videoFPS, preferredTimescale: 600)
-        videoFrameCount += 1
         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: presentationTime, decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
         CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample)
@@ -241,7 +244,7 @@ final class AV1SoftwarePlayer: NSObject, NativeVideoPlayerApiDelegate {
     }
 
     private func enqueueAudio(_ sampleBuffer: CMSampleBuffer, stop: UnsafeMutablePointer<ObjCBool>) {
-        guard let renderer = audioRenderer else { return }
+        guard let renderer = audioRenderer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= seekFloor else { return }
         while !renderer.isReadyForMoreMediaData && clockPrimed && !stopRequested {
             Thread.sleep(forTimeInterval: 0.01)
         }

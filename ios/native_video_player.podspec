@@ -22,11 +22,12 @@ A Flutter widget to play videos on iOS and Android using a native implementation
   headers = %w[avcodec avformat avutil swscale swresample].map { |l| "\"${PODS_TARGET_SRCROOT}/XCFrameworks/Lib#{l}.xcframework/ios-arm64/Lib#{l}.framework/Headers\"" }
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386', 'HEADER_SEARCH_PATHS' => "$(inherited) #{headers.join(' ')}" }
   s.swift_version = '5.0'
-  s.prepare_command = <<-CMD
+  dir = File.dirname(File.expand_path(__FILE__))
+  system(<<-CMD, chdir: dir, exception: true) unless File.directory?(File.join(dir, 'XCFrameworks'))
     set -eu
     curl -fsSL --retry 3 -o deps.zip "https://github.com/DrissiReda/native_video_player/releases/download/av1-ios9-deps-v1/native-video-player-ios9-deps-f8680fb.zip"
     echo '00ece99276ed7a35fcbc142b9e317b7a5384d08fae53340dae31a8023b30f6a3  deps.zip' | shasum -a 256 -c -
-    unzip -oq deps.zip 'XCFrameworks/*' -d . && rm deps.zip
+    unzip -oq deps.zip 'XCFrameworks/*' && rm deps.zip
   CMD
   s.vendored_frameworks = 'XCFrameworks/*.xcframework'
   s.libraries = 'z', 'bz2', 'iconv', 'c++'

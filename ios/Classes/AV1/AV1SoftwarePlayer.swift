@@ -1,71 +1,52 @@
 import AVFoundation
 
 final class AV1SoftwarePlayer: NativeVideoPlayerApiDelegate {
+    let displayLayer = AVSampleBufferDisplayLayer()
     private let api: NativeVideoPlayerApi
-    private let displayLayer = AVSampleBufferDisplayLayer()
+    private let engine: GAV1Player
     private let videoTimebase: CMTimebase
-    private var audioRenderer: AVSampleBufferAudioRenderer?
-    private var audioSynchronizer: AVSampleBufferRenderSynchronizer?
-    private var engine: GAV1Player?
+    private let audioRenderer = AVSampleBufferAudioRenderer()
+    private let audioSynchronizer = AVSampleBufferRenderSynchronizer()
     private let pumpQueue = DispatchQueue(label: "av1.software.pump", qos: .userInitiated)
+    private var pumping = false
     private var atEOF = false
-    private var stopFlag = false
-    private var pumpActive = false
-    private let stopLock = NSLock()
     private var loop = false
     private var rate: Float = 0
     private var speed: Double = 1
     private var clockPrimed = false
     private var seekFloor = CMTime.zero
-    private var info = VideoInfo(height: 0, width: 0, duration: 0)
-    private var positionTimer: Timer?
 
-    var layer: CALayer { displayLayer }
-
-    init(api: NativeVideoPlayerApi) {
+    init?(api: NativeVideoPlayerApi, videoSource: VideoSource) {
+        let isUrl = videoSource.type == .network
+        guard let url = isUrl ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else { return nil }
+        var headers = HTTPCookie.requestHeaderFields(with: SwiftNativeVideoPlayerPlugin.cookieStorage?.cookies(for: url) ?? [])
+        headers.merge(videoSource.headers) { _, new in new }
+        engine = GAV1Player(url: url, headers: headers)
+        guard engine.open() else { return nil }
         self.api = api
         var tb: CMTimebase?
         CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &tb)
         videoTimebase = tb!
         displayLayer.controlTimebase = videoTimebase
         displayLayer.videoGravity = .resizeAspect
+        audioSynchronizer.addRenderer(audioRenderer)
     }
 
-    func tryOpen(_ videoSource: VideoSource) -> Bool {
-        let isUrl = videoSource.type == .network
-        guard let url = isUrl ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else { return false }
-        var headers = HTTPCookie.requestHeaderFields(with: SwiftNativeVideoPlayerPlugin.cookieStorage?.cookies(for: url) ?? [])
-        headers.merge(videoSource.headers) { _, new in new }
-        let engine = GAV1Player(url: url, headers: headers)
-        guard engine.open() else { return false }
-        self.engine = engine
-        info = VideoInfo(height: Int(engine.videoHeight), width: Int(engine.videoWidth), duration: Int64(engine.durationSeconds * 1000))
-        if engine.hasAudio {
-            let renderer = AVSampleBufferAudioRenderer()
-            let sync = AVSampleBufferRenderSynchronizer()
-            sync.addRenderer(renderer)
-            audioRenderer = renderer
-            audioSynchronizer = sync
-        }
-        return true
-    }
-
-    func invalidate() {
-        positionTimer?.invalidate()
-        stopPump()
-        audioSynchronizer?.setRate(0, time: .zero)
+    deinit {
+        engine.stop = true
+        audioSynchronizer.setRate(0, time: .zero)
     }
 
     func loadVideoSource(videoSource: VideoSource) {
         api.onPlaybackReady()
-        positionTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+            guard let self = self else { return timer.invalidate() }
             self.api.onPlaybackPositionChanged(position: self.getPlaybackPosition())
         }
     }
 
     func getVideoInfo(completion: @escaping (VideoInfo) -> Void) {
-        completion(info)
+        completion(VideoInfo(height: Int(engine.videoHeight), width: Int(engine.videoWidth), duration: Int64(engine.durationSeconds * 1000)))
     }
 
     func getPlaybackPosition() -> Int64 {
@@ -92,19 +73,17 @@ final class AV1SoftwarePlayer: NativeVideoPlayerApiDelegate {
     }
 
     func seekTo(position: Int64, completion: @escaping () -> Void) {
-        guard let engine = engine else { return completion() }
         let seconds = Double(position) / 1000
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        stopPump()
+        engine.stop = true
         setClockTime(target)
         atEOF = false
-        pumpQueue.async { [weak self] in
+        pumpQueue.async { [weak self, engine] in
             engine.seek(toTime: seconds)
             DispatchQueue.main.async {
                 guard let self = self else { return completion() }
                 self.displayLayer.flush()
-                self.audioRenderer?.flush()
-                self.setClockTime(target)
+                self.audioRenderer.flush()
                 self.clockPrimed = false
                 self.seekFloor = target
                 self.startPump(rate: self.rate)
@@ -119,7 +98,7 @@ final class AV1SoftwarePlayer: NativeVideoPlayerApiDelegate {
     }
 
     func setVolume(volume: Double) {
-        audioRenderer?.volume = Float(volume)
+        audioRenderer.volume = Float(volume)
     }
 
     func setLoop(loop: Bool) {
@@ -134,35 +113,29 @@ final class AV1SoftwarePlayer: NativeVideoPlayerApiDelegate {
     private func applyClockRate(_ newRate: Float) {
         let now = CMTimebaseGetTime(videoTimebase)
         CMTimebaseSetRateAndAnchorTime(videoTimebase, rate: Double(newRate), anchorTime: now, immediateSourceTime: CMClockGetTime(CMClockGetHostTimeClock()))
-        audioSynchronizer?.setRate(newRate, time: now)
+        audioSynchronizer.setRate(newRate, time: now)
     }
 
     private func setClockTime(_ time: CMTime) {
         CMTimebaseSetTime(videoTimebase, time: time)
         CMTimebaseSetRate(videoTimebase, rate: 0)
-        audioSynchronizer?.setRate(0, time: time)
+        audioSynchronizer.setRate(0, time: time)
     }
 
     private func startPump(rate newRate: Float) {
-        guard let engine = engine else { return }
-        if stopLock.withLock({ pumpActive }) { return setClockRate(newRate) }
-        stopLock.withLock { stopFlag = false; pumpActive = true }
         setClockRate(newRate)
-        pumpQueue.async { [weak self] in
-            engine.decode(video: { [weak self] pixelBuffer, pts, stop in
-                guard let self = self else { stop.pointee = true; return }
-                self.enqueueVideo(pixelBuffer, pts: pts, stop: stop)
-            }, audio: { [weak self] sampleBuffer, stop in
-                guard let self = self else { stop.pointee = true; return }
-                self.enqueueAudio(sampleBuffer, stop: stop)
-            }, completion: { [weak self] error in
-                guard let self = self else { return }
-                let stopped = self.stopLock.withLock { () -> Bool in
-                    self.pumpActive = false
-                    return self.stopFlag
-                }
-                if stopped { return }
+        if pumping { return }
+        pumping = true
+        engine.stop = false
+        pumpQueue.async { [weak self, engine] in
+            engine.decode({ sample, video in
+                self?.enqueue(sample, video: video)
+            }, completion: { error in
+                let stopped = engine.stop
                 DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.pumping = false
+                    if stopped { return }
                     guard let error = error else { return self.onStreamEnded() }
                     self.setClockRate(0)
                     self.api.onError(error)
@@ -171,46 +144,20 @@ final class AV1SoftwarePlayer: NativeVideoPlayerApiDelegate {
         }
     }
 
-    private func stopPump() {
-        engine?.requestStop()
-        stopLock.withLock { stopFlag = true }
-    }
-
-    private var stopRequested: Bool {
-        stopLock.withLock { stopFlag }
-    }
-
-    private func enqueueVideo(_ pixelBuffer: CVPixelBuffer, pts: CMTime, stop: UnsafeMutablePointer<ObjCBool>) {
-        if pts < seekFloor { return }
-        while !displayLayer.isReadyForMoreMediaData && !stopRequested {
+    private func enqueue(_ sample: CMSampleBuffer, video: Bool) {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+        let renderer: AVQueuedSampleBufferRendering = video ? displayLayer : audioRenderer
+        guard pts >= seekFloor else { return }
+        while !renderer.isReadyForMoreMediaData && (video || clockPrimed) && !engine.stop {
             Thread.sleep(forTimeInterval: 0.01)
         }
-        if stopRequested { stop.pointee = true; return }
-
-        var format: CMVideoFormatDescription?
-        CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &format)
-        guard let format = format else { return }
-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
-        var sample: CMSampleBuffer?
-        CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample)
-        guard let sample = sample else { return }
-
-        if displayLayer.status == .failed { stop.pointee = true; return }
-        displayLayer.enqueue(sample)
-        if !clockPrimed {
+        if engine.stop { return }
+        renderer.enqueue(sample)
+        if video && !clockPrimed {
             clockPrimed = true
             CMTimebaseSetTime(videoTimebase, time: pts)
             applyClockRate(rate)
         }
-    }
-
-    private func enqueueAudio(_ sampleBuffer: CMSampleBuffer, stop: UnsafeMutablePointer<ObjCBool>) {
-        guard let renderer = audioRenderer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= seekFloor else { return }
-        while !renderer.isReadyForMoreMediaData && clockPrimed && !stopRequested {
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-        if stopRequested { stop.pointee = true; return }
-        renderer.enqueue(sampleBuffer)
     }
 
     private func onStreamEnded() {

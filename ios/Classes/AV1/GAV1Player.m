@@ -19,7 +19,6 @@
     struct SwsContext *_sws;
     SwrContext *_swr;
     CMAudioFormatDescriptionRef _adesc;
-    volatile BOOL _stop;
 }
 
 static NSData *gav1_get(GAV1Player *p, int64_t from, int64_t to) {
@@ -68,9 +67,8 @@ static AVCodecContext *gav1_open_codec(AVFormatContext *fmt, int stream, const A
     return ctx;
 }
 
-static CMTime gav1_pts(AVFrame *f, AVRational tb) {
-    int64_t pts = f->pts != AV_NOPTS_VALUE ? f->pts : f->pkt_dts;
-    return pts == AV_NOPTS_VALUE ? kCMTimeInvalid : CMTimeMake(pts * tb.num, tb.den);
+static CMTime gav1_pts(AVFrame *f, AVStream *s) {
+    return CMTimeMake(f->best_effort_timestamp * s->time_base.num, s->time_base.den);
 }
 
 - (instancetype)initWithURL:(NSURL *)url headers:(NSDictionary *)headers {
@@ -113,8 +111,6 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
 - (int)videoHeight { return _vdec->height; }
 
 - (double)durationSeconds { return _fmt->duration != AV_NOPTS_VALUE ? _fmt->duration / (double)AV_TIME_BASE : 0; }
-- (BOOL)hasAudio { return _adec != NULL; }
-- (void)requestStop { _stop = YES; }
 
 - (void)seekToTime:(double)seconds {
     int64_t ts = seconds / av_q2d(_fmt->streams[_vstream]->time_base);
@@ -123,7 +119,7 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
     if (_adec) avcodec_flush_buffers(_adec);
 }
 
-- (CVPixelBufferRef)pixelBufferFromFrame:(AVFrame *)frame {
+- (CMSampleBufferRef)videoSampleFromFrame:(AVFrame *)frame {
     if (!_sws) _sws = sws_getContext(frame->width, frame->height, frame->format, frame->width, frame->height, AV_PIX_FMT_NV12, SWS_BILINEAR, NULL, NULL, NULL);
     CVPixelBufferRef px = NULL;
     NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
@@ -133,7 +129,14 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
     int stride[4] = {(int)CVPixelBufferGetBytesPerRowOfPlane(px, 0), (int)CVPixelBufferGetBytesPerRowOfPlane(px, 1)};
     sws_scale(_sws, (const uint8_t * const *)frame->data, frame->linesize, 0, frame->height, dst, stride);
     CVPixelBufferUnlockBaseAddress(px, 0);
-    return px;
+    CMVideoFormatDescriptionRef format = NULL;
+    CMSampleBufferRef sb = NULL;
+    CMSampleTimingInfo timing = {kCMTimeInvalid, gav1_pts(frame, _fmt->streams[_vstream]), kCMTimeInvalid};
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, px, &format);
+    CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, px, format, &timing, &sb);
+    CFRelease(format);
+    CFRelease(px);
+    return sb;
 }
 
 - (CMSampleBufferRef)audioSampleFromFrame:(AVFrame *)frame {
@@ -145,41 +148,27 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
         av_free(pcm);
         return NULL;
     }
-    CMTime pts = gav1_pts(frame, _fmt->streams[_astream]->time_base);
-    CMSampleTimingInfo timing = {CMTimeMake(got, _adec->sample_rate), CMTIME_IS_VALID(pts) ? pts : kCMTimeZero, kCMTimeInvalid};
+    CMSampleTimingInfo timing = {CMTimeMake(got, _adec->sample_rate), gav1_pts(frame, _fmt->streams[_astream]), kCMTimeInvalid};
     CMSampleBufferRef sb = NULL;
     CMSampleBufferCreateReady(kCFAllocatorDefault, block, _adesc, got, 1, &timing, 0, NULL, &sb);
     CFRelease(block);
     return sb;
 }
 
-- (void)drain:(AVCodecContext *)dec frame:(AVFrame *)frame
-        video:(void (^)(CVPixelBufferRef, CMTime, BOOL *))video
-        audio:(void (^)(CMSampleBufferRef, BOOL *))audio {
-    while (!_stop && avcodec_receive_frame(dec, frame) >= 0) {
-        BOOL stop = NO;
-        if (dec == _vdec) {
-            CVPixelBufferRef px = [self pixelBufferFromFrame:frame];
-            if (px) video(px, gav1_pts(frame, _fmt->streams[_vstream]->time_base), &stop);
-            if (px) CFRelease(px);
-        } else {
-            CMSampleBufferRef sb = [self audioSampleFromFrame:frame];
-            if (sb) audio(sb, &stop);
-            if (sb) CFRelease(sb);
-        }
+- (void)drain:(AVCodecContext *)dec frame:(AVFrame *)frame handler:(void (^)(CMSampleBufferRef, BOOL))handler {
+    while (!self.stop && avcodec_receive_frame(dec, frame) >= 0) {
+        CMSampleBufferRef sb = dec == _vdec ? [self videoSampleFromFrame:frame] : [self audioSampleFromFrame:frame];
+        if (sb) handler(sb, dec == _vdec);
+        if (sb) CFRelease(sb);
         av_frame_unref(frame);
-        if (stop) _stop = YES;
     }
 }
 
-- (void)decodeWithVideo:(void (^)(CVPixelBufferRef, CMTime, BOOL *))video
-                  audio:(void (^)(CMSampleBufferRef, BOOL *))audio
-             completion:(void (^)(NSError *))completion {
-    _stop = NO;
+- (void)decode:(void (^)(CMSampleBufferRef, BOOL))handler completion:(void (^)(NSError *))completion {
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     NSError *err = nil;
-    while (!_stop) {
+    while (!self.stop) {
         int r = av_read_frame(_fmt, pkt);
         if (r < 0 && r != AVERROR_EOF) {
             err = [NSError errorWithDomain:@"GAV1Player" code:r userInfo:nil];
@@ -187,17 +176,17 @@ static CMTime gav1_pts(AVFrame *f, AVRational tb) {
         }
         AVPacket *p = r < 0 ? NULL : pkt;
         if ((!p || pkt->stream_index == _vstream) && avcodec_send_packet(_vdec, p) >= 0) {
-            [self drain:_vdec frame:frame video:video audio:audio];
+            [self drain:_vdec frame:frame handler:handler];
         }
         if (_adec && (!p || pkt->stream_index == _astream) && avcodec_send_packet(_adec, p) >= 0) {
-            [self drain:_adec frame:frame video:video audio:audio];
+            [self drain:_adec frame:frame handler:handler];
         }
         av_packet_unref(pkt);
         if (!p) break;
     }
     av_packet_free(&pkt);
     av_frame_free(&frame);
-    completion(_stop ? nil : err);
+    completion(err);
 }
 
 - (void)dealloc {

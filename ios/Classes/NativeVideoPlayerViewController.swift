@@ -45,7 +45,6 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
         timeControlObserver?.invalidate()
         removeOnVideoCompletedObserver()
         removePeriodicTimeObserver()
-        swPlayer?.invalidate()
 
         player.replaceCurrentItem(with: nil)
     }
@@ -63,18 +62,17 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
         pendingPlay = false
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            let sw = AV1SoftwarePlayer(api: self.api)
-            let opened = sw.tryOpen(videoSource)
+            let sw = AV1SoftwarePlayer(api: self.api, videoSource: videoSource)
             DispatchQueue.main.async {
                 self.probing = false
-                if opened {
+                if let sw = sw {
                     self.removeOnVideoCompletedObserver()
                     self.removePeriodicTimeObserver()
                     self.timeControlObserver?.invalidate()
                     self.player.replaceCurrentItem(with: nil)
                     self.swPlayer = sw
                     self.api.delegate = sw
-                    self.playerView.layer.addSublayer(sw.layer)
+                    self.playerView.layer.addSublayer(sw.displayLayer)
                     self.playerView.setNeedsLayout()
                     sw.loadVideoSource(videoSource: videoSource)
                 } else {

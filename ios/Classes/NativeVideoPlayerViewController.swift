@@ -1,6 +1,7 @@
 import AVFoundation
 import Flutter
 import Foundation
+import VideoToolbox
 
 public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
     private let api: NativeVideoPlayerApi
@@ -10,6 +11,9 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
     private var lastPosition: Int64 = -1
     private var timeObserver: Any?
     private var timeControlObserver: NSKeyValueObservation?
+    private var swPlayer: AV1SoftwarePlayer?
+    private var probing = false
+    private var pendingPlay = false
 
     init(
         messenger: FlutterBinaryMessenger,
@@ -53,6 +57,36 @@ public class NativeVideoPlayerViewController: NSObject, FlutterPlatformView {
 
 extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     func loadVideoSource(videoSource: VideoSource) {
+        guard !VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) else { return loadNativeVideoSource(videoSource) }
+        probing = true
+        pendingPlay = false
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let sw = AV1SoftwarePlayer(api: self.api, videoSource: videoSource)
+            DispatchQueue.main.async {
+                self.probing = false
+                if let sw = sw {
+                    self.removeOnVideoCompletedObserver()
+                    self.removePeriodicTimeObserver()
+                    self.timeControlObserver?.invalidate()
+                    self.player.replaceCurrentItem(with: nil)
+                    self.swPlayer = sw
+                    self.api.delegate = sw
+                    self.playerView.layer.addSublayer(sw.displayLayer)
+                    self.playerView.setNeedsLayout()
+                    sw.loadVideoSource(videoSource: videoSource)
+                } else {
+                    self.loadNativeVideoSource(videoSource)
+                }
+                if self.pendingPlay {
+                    self.pendingPlay = false
+                    self.api.delegate?.play()
+                }
+            }
+        }
+    }
+
+    private func loadNativeVideoSource(_ videoSource: VideoSource) {
         let isUrl = videoSource.type == .network
         let sourcePath = videoSource.path
         guard let uri = isUrl ? URL(string: sourcePath) : URL(fileURLWithPath: sourcePath) else { return }
@@ -141,6 +175,7 @@ extension NativeVideoPlayerViewController: NativeVideoPlayerApiDelegate {
     }
     
     func play() {
+        if probing { pendingPlay = true; return }
         if player.currentItem?.currentTime() == player.currentItem?.duration {
             player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
         }

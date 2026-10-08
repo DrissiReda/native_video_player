@@ -17,8 +17,10 @@ A Flutter widget to play videos on iOS and Android using a native implementation
   s.public_header_files = 'Classes/**/*.h'
   s.dependency 'Flutter'
 
-  s.platform = :ios, '9.0'
+  s.platform = :ios, '11.0'
   # Flutter.framework does not contain a i386 slice.
-  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386' }
+  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386', 'HEADER_SEARCH_PATHS' => '$(inherited) "${PODS_TARGET_SRCROOT}/AV1Deps/include"' }
   s.swift_version = '5.0'
+  system('sh', File.join(File.dirname(File.expand_path(__FILE__)), 'build-deps.sh'), exception: true)
+  s.vendored_frameworks = 'AV1Deps/AV1Deps.xcframework'
 end

@@ -29,5 +29,9 @@ class NativeVideoPlayerView: UIView {
         super.layoutSubviews()
         playerLayer.frame = bounds
         playerLayer.removeAllAnimations()
+        for sub in layer.sublayers ?? [] where sub is AVSampleBufferDisplayLayer {
+            sub.frame = bounds
+            sub.removeAllAnimations()
+        }
     }
 }

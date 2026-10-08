@@ -27,9 +27,9 @@ for sdk in iphoneos iphonesimulator; do
     --disable-avdevice --disable-avfilter --enable-libdav1d --enable-decoder=libdav1d,aac,opus \
     --enable-parser=av1,aac,opus --enable-demuxer=mov,matroska --enable-protocol=file &&
     make -j"$(sysctl -n hw.ncpu)" install)
-  libtool -static -o "$W/$sdk.a" "$out"/lib/*.a
+  libtool -static -o "$out/libAV1Deps.a" "$out"/lib/*.a
 done
 mkdir "$W/AV1Deps"
-xcodebuild -create-xcframework -library "$W/iphoneos.a" -library "$W/iphonesimulator.a" -output "$W/AV1Deps/AV1Deps.xcframework"
+xcodebuild -create-xcframework -library "$W/iphoneos/libAV1Deps.a" -library "$W/iphonesimulator/libAV1Deps.a" -output "$W/AV1Deps/AV1Deps.xcframework"
 cp -R "$W/iphoneos/include" "$W/AV1Deps/include"
 mv "$W/AV1Deps" AV1Deps

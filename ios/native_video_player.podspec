@@ -19,15 +19,8 @@ A Flutter widget to play videos on iOS and Android using a native implementation
 
   s.platform = :ios, '11.0'
   # Flutter.framework does not contain a i386 slice.
-  headers = %w[avcodec avformat avutil swscale swresample].map { |l| "\"${PODS_TARGET_SRCROOT}/XCFrameworks/Lib#{l}.xcframework/ios-arm64/Lib#{l}.framework/Headers\"" }
-  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386', 'HEADER_SEARCH_PATHS' => "$(inherited) #{headers.join(' ')}" }
+  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386', 'HEADER_SEARCH_PATHS' => '$(inherited) "${PODS_TARGET_SRCROOT}/AV1Deps/include"' }
   s.swift_version = '5.0'
-  dir = File.dirname(File.expand_path(__FILE__))
-  system(<<-CMD, chdir: dir, exception: true) unless File.directory?(File.join(dir, 'XCFrameworks'))
-    set -eu
-    curl -fsSL --retry 3 -o deps.zip "https://github.com/DrissiReda/native_video_player/releases/download/av1-ios9-deps-v1/native-video-player-ios9-deps-f8680fb.zip"
-    echo '00ece99276ed7a35fcbc142b9e317b7a5384d08fae53340dae31a8023b30f6a3  deps.zip' | shasum -a 256 -c -
-    unzip -oq deps.zip 'XCFrameworks/*' && rm deps.zip
-  CMD
-  s.vendored_frameworks = 'XCFrameworks/*.xcframework'
+  system('sh', File.join(File.dirname(File.expand_path(__FILE__)), 'build-deps.sh'), exception: true)
+  s.vendored_frameworks = 'AV1Deps/AV1Deps.xcframework'
 end

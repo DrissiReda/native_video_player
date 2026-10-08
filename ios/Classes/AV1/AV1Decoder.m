@@ -1,11 +1,11 @@
-#import "GAV1Player.h"
+#import "AV1Decoder.h"
 
 #import <libavformat/avformat.h>
 #import <libavcodec/avcodec.h>
 #import <libswscale/swscale.h>
 #import <libswresample/swresample.h>
 
-@implementation GAV1Player {
+@implementation AV1Decoder {
     NSURL *_url;
     NSDictionary *_headers;
     int64_t _length;
@@ -21,7 +21,7 @@
     CMAudioFormatDescriptionRef _adesc;
 }
 
-static NSData *gav1_get(GAV1Player *p, int64_t from, int64_t to) {
+static NSData *av1_get(AV1Decoder *p, int64_t from, int64_t to) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:p->_url];
     [req setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", from, to] forHTTPHeaderField:@"Range"];
     for (NSString *k in p->_headers) [req setValue:p->_headers[k] forHTTPHeaderField:k];
@@ -38,9 +38,9 @@ static NSData *gav1_get(GAV1Player *p, int64_t from, int64_t to) {
     return out;
 }
 
-static int gav1_read(void *opaque, uint8_t *buf, int size) {
-    GAV1Player *p = (__bridge GAV1Player *)opaque;
-    NSData *data = gav1_get(p, p->_position, p->_position + size - 1);
+static int av1_read(void *opaque, uint8_t *buf, int size) {
+    AV1Decoder *p = (__bridge AV1Decoder *)opaque;
+    NSData *data = av1_get(p, p->_position, p->_position + size - 1);
     if (!data) return AVERROR(EIO);
     if (!data.length) return AVERROR_EOF;
     int n = (int)MIN(data.length, (NSUInteger)size);
@@ -49,10 +49,10 @@ static int gav1_read(void *opaque, uint8_t *buf, int size) {
     return n;
 }
 
-static int64_t gav1_seek(void *opaque, int64_t offset, int whence) {
-    GAV1Player *p = (__bridge GAV1Player *)opaque;
+static int64_t av1_seek(void *opaque, int64_t offset, int whence) {
+    AV1Decoder *p = (__bridge AV1Decoder *)opaque;
     if (whence == AVSEEK_SIZE) {
-        if (p->_length < 0) gav1_get(p, 0, 0);
+        if (p->_length < 0) av1_get(p, 0, 0);
         return p->_length;
     }
     if (whence != SEEK_SET) return -1;
@@ -60,14 +60,14 @@ static int64_t gav1_seek(void *opaque, int64_t offset, int whence) {
     return offset;
 }
 
-static AVCodecContext *gav1_open_codec(AVFormatContext *fmt, int stream, const AVCodec *codec) {
+static AVCodecContext *av1_open_codec(AVFormatContext *fmt, int stream, const AVCodec *codec) {
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     ctx->thread_count = 0;
     if (avcodec_parameters_to_context(ctx, fmt->streams[stream]->codecpar) < 0 || avcodec_open2(ctx, codec, NULL) < 0) avcodec_free_context(&ctx);
     return ctx;
 }
 
-static CMTime gav1_pts(AVFrame *f, AVStream *s) {
+static CMTime av1_pts(AVFrame *f, AVStream *s) {
     return CMTimeMake(f->best_effort_timestamp * s->time_base.num, s->time_base.den);
 }
 
@@ -82,7 +82,7 @@ static CMTime gav1_pts(AVFrame *f, AVStream *s) {
 
 - (BOOL)open {
     if (!_url.isFileURL) {
-        _pb = avio_alloc_context(av_malloc(128 * 1024), 128 * 1024, 0, (__bridge void *)self, gav1_read, NULL, gav1_seek);
+        _pb = avio_alloc_context(av_malloc(128 * 1024), 128 * 1024, 0, (__bridge void *)self, av1_read, NULL, av1_seek);
         _fmt = avformat_alloc_context();
         _fmt->pb = _pb;
     }
@@ -91,10 +91,10 @@ static CMTime gav1_pts(AVFrame *f, AVStream *s) {
 
     const AVCodec *vcodec = NULL, *acodec = NULL;
     _vstream = av_find_best_stream(_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vcodec, 0);
-    if (_vstream < 0 || vcodec->id != AV_CODEC_ID_AV1 || !(_vdec = gav1_open_codec(_fmt, _vstream, vcodec))) return NO;
+    if (_vstream < 0 || vcodec->id != AV_CODEC_ID_AV1 || !(_vdec = av1_open_codec(_fmt, _vstream, vcodec))) return NO;
 
     _astream = av_find_best_stream(_fmt, AVMEDIA_TYPE_AUDIO, -1, _vstream, &acodec, 0);
-    if (_astream >= 0 && (_adec = gav1_open_codec(_fmt, _astream, acodec))) {
+    if (_astream >= 0 && (_adec = av1_open_codec(_fmt, _astream, acodec))) {
         AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
         if (swr_alloc_set_opts2(&_swr, &stereo, AV_SAMPLE_FMT_S16, _adec->sample_rate, &_adec->ch_layout, _adec->sample_fmt, _adec->sample_rate, 0, NULL) < 0 || swr_init(_swr) < 0) {
             swr_free(&_swr);
@@ -131,7 +131,7 @@ static CMTime gav1_pts(AVFrame *f, AVStream *s) {
     CVPixelBufferUnlockBaseAddress(px, 0);
     CMVideoFormatDescriptionRef format = NULL;
     CMSampleBufferRef sb = NULL;
-    CMSampleTimingInfo timing = {kCMTimeInvalid, gav1_pts(frame, _fmt->streams[_vstream]), kCMTimeInvalid};
+    CMSampleTimingInfo timing = {kCMTimeInvalid, av1_pts(frame, _fmt->streams[_vstream]), kCMTimeInvalid};
     CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, px, &format);
     CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, px, format, &timing, &sb);
     CFRelease(format);
@@ -148,7 +148,7 @@ static CMTime gav1_pts(AVFrame *f, AVStream *s) {
         av_free(pcm);
         return NULL;
     }
-    CMSampleTimingInfo timing = {CMTimeMake(got, _adec->sample_rate), gav1_pts(frame, _fmt->streams[_astream]), kCMTimeInvalid};
+    CMSampleTimingInfo timing = {CMTimeMake(got, _adec->sample_rate), av1_pts(frame, _fmt->streams[_astream]), kCMTimeInvalid};
     CMSampleBufferRef sb = NULL;
     CMSampleBufferCreateReady(kCFAllocatorDefault, block, _adesc, got, 1, &timing, 0, NULL, &sb);
     CFRelease(block);
@@ -171,7 +171,7 @@ static CMTime gav1_pts(AVFrame *f, AVStream *s) {
     while (!self.stop) {
         int r = av_read_frame(_fmt, pkt);
         if (r < 0 && r != AVERROR_EOF) {
-            err = [NSError errorWithDomain:@"GAV1Player" code:r userInfo:nil];
+            err = [NSError errorWithDomain:@"AV1Decoder" code:r userInfo:nil];
             break;
         }
         AVPacket *p = r < 0 ? NULL : pkt;

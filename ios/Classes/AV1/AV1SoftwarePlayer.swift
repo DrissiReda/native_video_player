@@ -3,7 +3,7 @@ import AVFoundation
 final class AV1SoftwarePlayer: NativeVideoPlayerApiDelegate {
     let displayLayer = AVSampleBufferDisplayLayer()
     private let api: NativeVideoPlayerApi
-    private let engine: GAV1Player
+    private let engine: AV1Decoder
     private let videoTimebase: CMTimebase
     private let audioRenderer = AVSampleBufferAudioRenderer()
     private let audioSynchronizer = AVSampleBufferRenderSynchronizer()
@@ -21,7 +21,7 @@ final class AV1SoftwarePlayer: NativeVideoPlayerApiDelegate {
         guard let url = isUrl ? URL(string: videoSource.path) : URL(fileURLWithPath: videoSource.path) else { return nil }
         var headers = HTTPCookie.requestHeaderFields(with: SwiftNativeVideoPlayerPlugin.cookieStorage?.cookies(for: url) ?? [])
         headers.merge(videoSource.headers) { _, new in new }
-        engine = GAV1Player(url: url, headers: headers)
+        engine = AV1Decoder(url: url, headers: headers)
         guard engine.open() else { return nil }
         self.api = api
         var tb: CMTimebase?

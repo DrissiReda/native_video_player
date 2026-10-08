@@ -3,7 +3,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface GAV1Player : NSObject
+@interface AV1Decoder : NSObject
 
 - (instancetype)initWithURL:(NSURL *)url headers:(NSDictionary<NSString *, NSString *> *)headers;
 - (BOOL)open;
